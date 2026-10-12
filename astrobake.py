@@ -211,11 +211,11 @@ def mtf(x, m, target):
 
 
 # Default slider values ("natural"). Every look is reachable from the sliders in the UI.
-DEFAULTS = dict(stretch=900, target=0.13, sat=1.7, sky=0.075, denoise=1.3, contrast=0.0, sharpen=0.0, temp=0.0, tint=0.0)
+DEFAULTS = dict(stretch=900, target=0.13, sat=1.7, sky=0.075, denoise=0.8, chroma=2.5, contrast=0.0, sharpen=0.0, temp=0.0, tint=0.0)
 PARAMS = tuple(DEFAULTS)
 
 
-def process(a, stretch=900., target=0.13, sat=1.7, sky=0.075, denoise=1.3, contrast=0., sharpen=0., temp=0., tint=0.,
+def process(a, stretch=900., target=0.13, sat=1.7, sky=0.075, denoise=0.8, chroma=2.5, contrast=0., sharpen=0., temp=0., tint=0.,
             stats=None, px=1.0):
     """Non-linear processing, in place where possible.
 
@@ -252,7 +252,10 @@ def process(a, stretch=900., target=0.13, sat=1.7, sky=0.075, denoise=1.3, contr
         for c in range(3):      # one channel at a time keeps the full-res temporaries small
             x = np.clip(a[..., c], 0, 1)    # mtf can overshoot by a hair, and a negative base ** k is NaN
             a[..., c] = np.where(x < pv, pv * (x / pv) ** k, 1 - (1 - pv) * ((1 - x) / (1 - pv)) ** k)
-    L = a.mean(2, keepdims=True); a -= L; a *= sat; a += L; del L         # saturation
+    L = a.mean(2, keepdims=True); a -= L                                # split into brightness + color
+    if chroma > 0.05:   # color noise reduction: blur only the color, so stars and structure stay sharp
+        a[:] = cv2.GaussianBlur(a, (0, 0), chroma / px)
+    a *= sat; a += L; del L                                              # saturation
     np.clip(a, 0, 1, out=a)
 
     if sharpen > 0.01:   # unsharp mask on the brighter structure only, so background noise isn't amplified
@@ -344,13 +347,17 @@ def jpeg_bytes(a, q=90):
     return buf.getvalue()
 
 
-def render_full(full, base_stats, settings, angle=0.0, crop=None):
-    """Full-resolution result: process -> rotate -> crop. Used by both export and --batch."""
+def render_full(full, base_stats, settings, angle=0.0, crop=None, scale=1.0):
+    """Full-resolution result: process -> rotate -> crop -> resize. Used by both export and --batch."""
     a = process(full.copy(), stats=dict(base_stats), **settings)
     a = rotate(a, angle, quality=True)
     if crop is None and abs(angle) % 90 > 1e-6:
         crop = inscribed_crop(full.shape[1], full.shape[0], angle)
-    return apply_crop(a, crop)
+    a = apply_crop(a, crop)
+    if scale < 0.999:   # area averaging: soft stars at 100% come out tight and crisp
+        h, w = a.shape[:2]
+        a = cv2.resize(a, (max(1, round(w * scale)), max(1, round(h * scale))), interpolation=cv2.INTER_AREA)
+    return a
 
 
 # ---------------------------------------------------------------- web UI
@@ -614,8 +621,9 @@ body.dropping main::after{content:"Drop to open";position:absolute;inset:12px;bo
     <h2>Tone &amp; color <button id="t_reset">Reset</button></h2>
     <div id="ctls"></div>
     <div class="export">
+      <div class="guiderow" style="margin:0 0 10px">Size<span class="seg" id="sizes"><button data-s="1">100%</button><button data-s="0.75">75%</button><button data-s="0.5">50%</button></span></div>
       <label><input type="checkbox" id="tif"> Also save 16-bit TIFF</label>
-      <button class="primary" id="exp">Export full resolution</button>
+      <button class="primary" id="exp">Export</button>
       <div id="msg"></div>
       <code id="cmd"></code>
     </div>
@@ -647,6 +655,7 @@ const CTL = [
  {k:"temp", name:"Color temperature", min:-1, max:1},
  {k:"tint", name:"Tint", min:-1, max:1},
  {k:"sharpen", name:"Sharpening", min:0, max:2, amount:true},
+ {k:"chroma", name:"Color noise reduction", min:0, max:8},
  {k:"denoise", name:"Background noise reduction", min:0, max:4},
 ];
 let P = {}, DEF = {}, A = 0, C = [0,0,1,1], W = 0, H = 0, W2 = 0, H2 = 0, DW = 1100, DH = 700;
@@ -698,6 +707,7 @@ function drawCrop(){
   b.style.width = (C[2]-C[0])*100+"%"; b.style.height = (C[3]-C[1])*100+"%";
   const ok = cropInside();
   $("v_crop").textContent = Math.round((C[2]-C[0])*W2) + " × " + Math.round((C[3]-C[1])*H2) + " px";
+  exportLabel();
   $("w_crop").style.display = ok ? "none" : "block";
   b.style.borderColor = ok ? "" : "#ff7a59";
   updateCmd(); drawResult();
@@ -752,6 +762,7 @@ function updateCmd(){
   let s = `python astrobake.py "${window.FILE}" --batch ` + CTL.map(c => `--${c.k} ${P[c.k]}`).join(" ");
   if (A) s += ` --rotate ${A}`;
   if ($("tif").checked) s += " --tif";
+  if (SCALE < 1) s += ` --scale ${SCALE}`;
   if (C.some((v,i) => Math.abs(v - [0,0,1,1][i]) > 1e-4)) s += ` --crop ${C.map(v => v.toFixed(4)).join(",")}`;
   $("cmd").textContent = s;
 }
@@ -898,6 +909,20 @@ $("r_0").onclick = () => setAngle(0);
 $("c_reset").onclick = () => { C = inscribed(); drawCrop(); };
 $("t_reset").onclick = () => setTone(DEF);
 $("tif").onchange = updateCmd;
+let SCALE = 1;
+function setSize(v){
+  SCALE = v;
+  document.querySelectorAll("#sizes button").forEach(b => b.classList.toggle("on", +b.dataset.s === v));
+  try{ localStorage.setItem("size", v); } catch(e){}
+  exportLabel(); updateCmd();
+}
+function exportLabel(){
+  const w = Math.round((C[2]-C[0])*W2*SCALE), h = Math.round((C[3]-C[1])*H2*SCALE);
+  $("exp").textContent = loaded ? `Export ${w} × ${h} px` : "Export";
+}
+document.querySelectorAll("#sizes button").forEach(b => b.onclick = () => setSize(+b.dataset.s));
+let savedSize = null; try{ savedSize = +localStorage.getItem("size"); } catch(e){}
+setSize([1, 0.75, 0.5].includes(savedSize) ? savedSize : 1);
 function setGuides(g){
   $("cropbox").dataset.g = g;
   document.querySelectorAll("#guides button").forEach(b => b.classList.toggle("on", b.dataset.g === g));
@@ -909,7 +934,7 @@ setGuides(["thirds","center","both","none"].includes(savedGuides) ? savedGuides 
 $("exp").addEventListener("click", async () => {
   $("exp").disabled = true; $("msg").textContent = "Exporting full resolution… (takes a few seconds)";
   try{
-    const r = await fetch("/export?" + qs({crop: C.join(","), tif: $("tif").checked ? 1 : 0}), {method:"POST"});
+    const r = await fetch("/export?" + qs({crop: C.join(","), tif: $("tif").checked ? 1 : 0, scale: SCALE}), {method:"POST"});
     const j = await r.json();
     $("msg").textContent = j.error ? "Error: "+j.error : "Saved: " + j.files.join(", ");
   } catch(e){ $("msg").textContent = "Error: " + e; }
@@ -1116,8 +1141,8 @@ def run_ui(path=None, crop=True, port=8765, open_browser=True, out=None, auto_qu
         Minv = cv2.invertAffineTransform(M)
         pts = np.array([[x0, y0, 1], [x0 + dw, y0, 1], [x0, y0 + dh, 1], [x0 + dw, y0 + dh, 1]], float)
         src = pts @ Minv.T
-        sx0, sy0 = (max(0, int(math.floor(v)) - 12) for v in src.min(0))
-        sx1, sy1 = min(W, int(math.ceil(src[:, 0].max())) + 12), min(H, int(math.ceil(src[:, 1].max())) + 12)
+        sx0, sy0 = (max(0, int(math.floor(v)) - 28) for v in src.min(0))
+        sx1, sy1 = min(W, int(math.ceil(src[:, 0].max())) + 28), min(H, int(math.ceil(src[:, 1].max())) + 28)
         _, st = render_preview(s)                               # image-wide stats
         if sx1 <= sx0 or sy1 <= sy0:
             return np.zeros((dh, dw, 3), np.float32)
@@ -1215,7 +1240,8 @@ def run_ui(path=None, crop=True, port=8765, open_browser=True, out=None, auto_qu
                     s = params(q); tif = q.get("tif", ["1"])[0] == "1"
                     crop = [float(v) for v in q.get("crop", ["0,0,1,1"])[0].split(",")]
                     with lock:   # same code path as --batch, so UI export == command-line output
-                        img = render_full(S["full"], S["base"], s, num(q, "angle"), crop)
+                        scale = min(1.0, max(0.1, float(q.get("scale", ["1"])[0])))
+                        img = render_full(S["full"], S["base"], s, num(q, "angle"), crop, scale)
                         files = save(img, S["out"], tif=tif); del img; gc.collect()
                     return self.send_json({"files": [os.path.abspath(f) for f in files]})
                 self.send(b"not found", "text/plain", 404)
@@ -1265,6 +1291,7 @@ def main():
     p.add_argument("--no-browser", action="store_true", help="don't auto-open the browser")
     p.add_argument("-o", "--out", default=None, help="output name prefix")
     p.add_argument("--tif", action="store_true", help="batch: also write a 16-bit TIFF")
+    p.add_argument("--scale", type=float, default=1.0, help="batch: output size, e.g. 0.5 for half (default 1)")
     p.add_argument("--no-crop", action="store_true", help="skip the automatic dead-edge crop")
     d = DEFAULTS
     p.add_argument("--stretch", type=float, default=d["stretch"], help="arcsinh strength: higher = brighter faint stuff, compressed core")
@@ -1273,6 +1300,7 @@ def main():
     p.add_argument("--contrast", type=float, default=d["contrast"], help="contrast, -1 = flatter .. 1 = punchier")
     p.add_argument("--sat", type=float, default=d["sat"], help="saturation multiplier")
     p.add_argument("--denoise", type=float, default=d["denoise"], help="background blur sigma, 0 = off")
+    p.add_argument("--chroma", type=float, default=d["chroma"], help="color noise blur sigma, 0 = off")
     p.add_argument("--sharpen", type=float, default=d["sharpen"], help="sharpening of bright structure (0-2), 0 = off")
     p.add_argument("--temp", type=float, default=d["temp"], help="color temperature, -1 = cooler .. 1 = warmer")
     p.add_argument("--tint", type=float, default=d["tint"], help="tint, -1 = greener .. 1 = more magenta")
@@ -1295,7 +1323,9 @@ def main():
     settings = {k: getattr(args, k) for k in PARAMS}
     a, base_stats = prepare(args.input, not args.no_crop)
     print("settings:", settings, f"rotate={args.rotate}", f"crop={crop}")
-    r = render_full(a, base_stats, settings, args.rotate, crop)
+    if not 0.1 <= args.scale <= 1:
+        sys.exit("--scale must be between 0.1 and 1")
+    r = render_full(a, base_stats, settings, args.rotate, crop, args.scale)
     save(r, out, tif=args.tif)
 
 
