@@ -1,0 +1,75 @@
+# Builds the standalone apps. Push a version tag to publish a release with them attached:
+#   git tag v1.0.0 && git push origin v1.0.0
+# "Run workflow" on the Actions tab builds without releasing (download them from the run page).
+name: Build apps
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            asset: AstroBake-Windows.exe
+          - os: macos-latest          # Apple Silicon
+            asset: AstroBake-macOS.zip
+          - os: ubuntu-22.04          # oldest supported glibc = runs on the most distros
+            asset: AstroBake-Linux.tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt "pyinstaller>=6.10,<7"
+          python -c "import tkinter"
+      - name: Build
+        run: pyinstaller astrobake.spec
+
+      - name: Smoke test and package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $p = Start-Process dist/AstroBake.exe -ArgumentList "--help" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { exit 1 }
+          Copy-Item dist/AstroBake.exe ${{ matrix.asset }}
+      - name: Smoke test and package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          dist/AstroBake.app/Contents/MacOS/AstroBake --help > /dev/null
+          ditto -c -k --keepParent dist/AstroBake.app ${{ matrix.asset }}
+      - name: Smoke test and package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          dist/AstroBake --help > /dev/null
+          tar -czf ${{ matrix.asset }} -C dist AstroBake
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: assets/*
+          generate_release_notes: true

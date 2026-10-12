@@ -8,8 +8,8 @@ Steps: crop dead stacking edges -> remove background gradient -> neutralize sky
 + midtone stretch -> SCNR green removal -> S-curve -> saturation -> background
 noise reduction -> final sky neutralization -> rotate -> crop.
 
-Start:    double-click "AstroBake.bat" (Windows), or drag a TIFF onto it
-          python astrobake.py                          # UI, pick a file in the page
+App:      ready-to-run Windows/macOS/Linux downloads, no Python needed - see README.md
+Start:    python astrobake.py                          # UI, pick a file in the page
           python astrobake.py stacked.tif              # UI with that file loaded
 Batch:    python astrobake.py stacked.tif --batch      # default settings straight to files
           python astrobake.py stacked.tif --batch --stretch 4000 --rotate 12.5
@@ -21,6 +21,21 @@ Outputs:  <name>_processed_16bit.tif (for further editing in GIMP) and <name>_pr
 Needs roughly 6x the image size in RAM (about 2 GB for a 24 MP stack).
 """
 import sys, importlib.util, os, shutil, subprocess
+
+FROZEN = getattr(sys, "frozen", False)   # running as the packaged app (PyInstaller), not a script
+
+if sys.argv[1:2] == ["--pick-file"]:
+    # helper process for the native file dialog (see pick_file); writes the choice to a file
+    # because a packaged app without a console has no usable stdout
+    import tkinter as tk
+    from tkinter import filedialog
+    r = tk.Tk(); r.withdraw()
+    try: r.attributes("-topmost", True)
+    except Exception: pass
+    p = filedialog.askopenfilename(title="Open stacked image", initialdir=sys.argv[2] or None,
+                                   filetypes=[("TIFF images", "*.tif *.tiff"), ("All files", "*.*")])
+    with open(sys.argv[3], "w", encoding="utf-8") as f: f.write(p or "")
+    sys.exit(0)
 
 # ---------------------------------------------------------------- dependency check
 REQUIRED = {"numpy": "numpy", "tifffile": "tifffile", "imagecodecs": "imagecodecs",
@@ -84,7 +99,7 @@ if _missing:
     print("\nInstalled. Starting…\n")
     sys.exit(subprocess.call([_venv_py, os.path.abspath(__file__), *sys.argv[1:]]))
 
-import argparse, gc, io, json, math, threading, webbrowser
+import argparse, gc, io, json, math, tempfile, threading, time, webbrowser
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 import numpy as np, tifffile, cv2
@@ -325,7 +340,8 @@ UI_HTML = r"""<!doctype html>
 body{margin:0;background:var(--bg);color:var(--text);font:14px/1.4 system-ui,-apple-system,Segoe UI,sans-serif;
      display:grid;grid-template-columns:310px 1fr;height:100vh;overflow:hidden}
 aside{background:var(--panel);border-right:1px solid var(--line);padding:18px;overflow:auto}
-h1{font-size:16px;margin:0 0 8px}
+h1{font-size:16px;margin:0 0 8px;display:flex;justify-content:space-between;align-items:center}
+h1 button{font-size:11px;font-weight:400;padding:3px 8px}
 h2{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--dim);margin:20px 0 10px;
    display:flex;justify-content:space-between;align-items:center;font-weight:600}
 h2 button{font-size:11px;padding:3px 8px;letter-spacing:0;text-transform:none}
@@ -373,7 +389,7 @@ main{display:grid;grid-template-rows:58% 42%;min-height:0;position:relative}
 .ctlwrap.off{opacity:.4;pointer-events:none}
 </style></head><body>
 <aside>
-  <h1>AstroBake</h1>
+  <h1>AstroBake <button id="quit" title="Stop AstroBake">Quit</button></h1>
   <div class="filebar"><div class="file" id="file">No image loaded</div><button id="open2">Open…</button></div>
   <div class="ctlwrap off" id="ctlwrap">
     <h2>Rotate &amp; crop</h2>
@@ -599,6 +615,7 @@ function showWelcome(title, text){
 }
 function applyInfo(info){
   DEF = info.defaults;
+  if (info.app) $("cmd").style.display = "none";      // the packaged app has no command line to paste into
   if (!info.loaded){ showWelcome("Open a stacked image"); return; }
   loaded = true; window.FILE = info.file; W = info.W; H = info.H; DW = info.DW; DH = info.DH;
   $("file").textContent = info.name + "  (" + W + "×" + H + " after edge crop)"; $("file").title = info.file;
@@ -623,6 +640,16 @@ async function openWith(url){
   $("open1").disabled = $("open2").disabled = false;
 }
 $("open1").onclick = $("open2").onclick = () => openWith("/open");
+
+/* ---------- lifetime: tell the server we're here, and when we leave ---------- */
+function closed(){
+  showWelcome("AstroBake has closed", "Start it again to keep working. You can close this tab.");
+  $("open1").style.display = "none"; $("pathbox").style.display = "none";
+  $("ctlwrap").classList.add("off"); $("quit").disabled = $("open2").disabled = true;
+}
+$("quit").onclick = async () => { try{ await fetch("/quit", {method:"POST"}); } catch(e){} closed(); };
+setInterval(() => fetch("/ping").then(r => { if (!r.ok) throw 0; }).catch(closed), 20000);
+addEventListener("pagehide", () => navigator.sendBeacon("/bye"));
 $("pathin").addEventListener("keydown", e => {
   if (e.key === "Enter" && e.target.value.trim()){
     const p = e.target.value.trim().replace(/^"|"$/g, "");
@@ -633,34 +660,29 @@ $("pathin").addEventListener("keydown", e => {
 (async () => { applyInfo(await (await fetch("/info")).json()); })();
 </script></body></html>"""
 
-_PICKER = r"""
-import sys, tkinter as tk
-from tkinter import filedialog
-r = tk.Tk(); r.withdraw()
-try: r.attributes('-topmost', True)
-except Exception: pass
-p = filedialog.askopenfilename(title='Open stacked image', initialdir=sys.argv[1] or None,
-        filetypes=[('TIFF images', '*.tif *.tiff'), ('All files', '*.*')])
-print(p or '')
-"""
-
-
 def pick_file(initial_dir=""):
     """Native file dialog, run in a subprocess so it works from the server thread on every OS.
     Returns path, "" if cancelled, or None if no GUI toolkit is available."""
+    me = [sys.executable] if FROZEN else [sys.executable, os.path.abspath(__file__)]
+    fd, result = tempfile.mkstemp(suffix=".txt"); os.close(fd)
     try:
-        r = subprocess.run([sys.executable, "-c", _PICKER, initial_dir], capture_output=True, text=True, timeout=1800)
+        r = subprocess.run([*me, "--pick-file", initial_dir, result], capture_output=True, timeout=1800)
+        if r.returncode != 0:
+            return None
+        with open(result, encoding="utf-8") as f: return f.read().strip()
     except Exception:
         return None
-    if r.returncode != 0:
-        return None
-    return r.stdout.strip()
+    finally:
+        os.remove(result)
 
 
-def run_ui(path=None, crop=True, port=8765, open_browser=True, out=None):
+def run_ui(path=None, crop=True, port=8765, open_browser=True, out=None, auto_quit=False):
+    """Serve the UI. With auto_quit (the packaged app has no console window to close) the server
+    stops shortly after the last browser tab closes, or when nothing has been heard for a while."""
     S = {"path": None}                     # current image state
     lock = threading.Lock()
     DW, DH = 1100, 700                     # 1:1 detail window size (pixels)
+    seen = {"last": time.monotonic(), "bye": None}
 
     def load_image(p):
         print(f"\nLoading {p}\nPreparing image (crop, gradient removal, white balance)…")
@@ -674,7 +696,7 @@ def run_ui(path=None, crop=True, port=8765, open_browser=True, out=None):
         print("ready")
 
     def info():
-        d = {"loaded": S.get("path") is not None, "defaults": DEFAULTS}
+        d = {"loaded": S.get("path") is not None, "defaults": DEFAULTS, "app": FROZEN}
         if d["loaded"]:
             d.update(file=S["path"], name=os.path.basename(S["path"]), W=S["W"], H=S["H"], DW=DW, DH=DH)
         return d
@@ -712,6 +734,12 @@ def run_ui(path=None, crop=True, port=8765, open_browser=True, out=None):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a): pass
 
+        def parse_request(self):
+            ok = super().parse_request()
+            if ok and self.path != "/bye":          # any request means a tab is still open
+                seen["last"] = time.monotonic(); seen["bye"] = None
+            return ok
+
         def send(self, body, ctype, code=200):
             self.send_response(code)
             self.send_header("Content-Type", ctype)
@@ -729,6 +757,8 @@ def run_ui(path=None, crop=True, port=8765, open_browser=True, out=None):
                     return self.send(UI_HTML.encode(), "text/html; charset=utf-8")
                 if u.path == "/info":
                     return self.send_json(info())
+                if u.path == "/ping":
+                    return self.send(b"ok", "text/plain")
                 if not S.get("path"):
                     return self.send(b"no image loaded", "text/plain", 409)
                 if u.path == "/preview":
@@ -747,9 +777,16 @@ def run_ui(path=None, crop=True, port=8765, open_browser=True, out=None):
         def do_POST(self):
             u = urlparse(self.path); q = parse_qs(u.query)
             try:
+                if u.path == "/bye":                    # a tab closed (sent by the page on pagehide)
+                    seen["bye"] = time.monotonic()
+                    return self.send(b"ok", "text/plain")
+                if u.path == "/quit":
+                    self.send(b"ok", "text/plain")
+                    return threading.Thread(target=srv.shutdown).start()
                 if u.path in ("/open", "/load"):
                     if u.path == "/open":
-                        start = os.path.dirname(S["path"]) if S.get("path") else os.getcwd()
+                        start = os.path.dirname(S["path"]) if S.get("path") else \
+                            (os.path.expanduser("~") if FROZEN else os.getcwd())
                         p = pick_file(start)
                         if p is None: return self.send_json({"error": "nodialog"})
                         if p == "": return self.send_json({"cancelled": True})
@@ -786,9 +823,19 @@ def run_ui(path=None, crop=True, port=8765, open_browser=True, out=None):
         sys.exit(f"No free port between {port} and {port + 19}")
     url = f"http://127.0.0.1:{srv.server_address[1]}/"
     print(f"\nAstroBake running at {url}")
-    print("Leave this window open while you use it. Close it (or press Ctrl+C) to quit.")
+    print("Leave this window open while you use it. Close it, press Ctrl+C or click Quit in the page to quit.")
     if open_browser:
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()
+
+    def watchdog():
+        while True:
+            time.sleep(1)
+            now = time.monotonic()
+            # 5 s grace lets a reload reconnect; 10 min covers browsers that throttle background tabs
+            if (seen["bye"] and now - seen["bye"] > 5) or now - seen["last"] > 600:
+                return srv.shutdown()
+    if auto_quit:
+        threading.Thread(target=watchdog, daemon=True).start()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
@@ -820,7 +867,7 @@ def main():
         sys.exit(f"File not found: {args.input}")
 
     if not args.batch:
-        return run_ui(args.input, not args.no_crop, args.port, not args.no_browser, args.out)
+        return run_ui(args.input, not args.no_crop, args.port, not args.no_browser, args.out, auto_quit=FROZEN)
 
     if not args.input:
         sys.exit("--batch needs an input file")
