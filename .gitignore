@@ -2,8 +2,3 @@
 __pycache__/
 build/
 dist/
-
-# your own images (stacks are far too big for git)
-*.tif
-*.tiff
-*_processed.jpg
