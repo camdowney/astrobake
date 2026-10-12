@@ -16,8 +16,9 @@ Batch:    python astrobake.py stacked.tif --batch      # default settings straig
           (the UI shows the exact --batch command for whatever you've dialed in)
 Packages: numpy tifffile imagecodecs opencv-python-headless pillow (it offers to install them,
           in a private .venv if the system Python is locked or has no pip)
-Outputs:  <name>_processed.jpg next to the input file, plus <name>_processed_16bit.tif
+Outputs:  <name>_processed_<W>x<H>.jpg next to the input file, plus a matching _16bit.tif
           (for further editing in GIMP) with --tif or the UI's TIFF checkbox.
+          Never overwrites: a repeat export of the same size gets _2, _3...
 Needs roughly 6x the image size in RAM (about 2 GB for a 24 MP stack).
 """
 import sys, importlib.util, os, shutil, subprocess
@@ -330,8 +331,16 @@ def apply_crop(a, crop):
 
 
 # ---------------------------------------------------------------- output helpers
+def unique_base(out):
+    """out, or out_2, out_3... so an export never overwrites an earlier one (JPG and TIFF share the number)."""
+    base, n = out, 1
+    while os.path.exists(base + ".jpg") or os.path.exists(base + "_16bit.tif"):
+        n += 1; base = f"{out}_{n}"
+    return base
+
+
 def save(a, out, tif=False):
-    written = []
+    out = unique_base(f"{out}_{a.shape[1]}x{a.shape[0]}"); written = []
     if tif:
         tifffile.imwrite(out + "_16bit.tif", (a * 65535 + .5).astype(np.uint16), compression="zlib")
         written.append(out + "_16bit.tif")
