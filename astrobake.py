@@ -341,10 +341,12 @@ def render_full(full, base_stats, settings, angle=0.0, crop=None):
 UI_HTML = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AstroBake</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-:root{--bg:#0b0d12;--panel:#141821;--line:#262c38;--text:#dfe4ee;--dim:#8a93a6;--acc:#7aa2ff;}
+:root{--bg:#111111;--panel:#1a1a1a;--line:#2e2e2e;--text:#ececec;--dim:#9a9a9a;--acc:#d9b25f;--warn:#ff7a59;}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--text);font:14px/1.4 system-ui,-apple-system,Segoe UI,sans-serif;
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 Roboto,system-ui,-apple-system,Segoe UI,sans-serif;
      display:grid;grid-template-columns:310px 1fr;height:100vh;overflow:hidden}
 aside{background:var(--panel);border-right:1px solid var(--line);padding:18px;overflow:auto}
 h1{font-size:16px;margin:0 0 8px;display:flex;justify-content:space-between;align-items:center}
@@ -354,17 +356,18 @@ h2{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--dim)
 h2 button{font-size:11px;padding:3px 8px;letter-spacing:0;text-transform:none}
 .filebar{display:flex;gap:8px;align-items:center}
 .file{color:var(--dim);font-size:12px;word-break:break-all;flex:1}
-button{background:#1d2330;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:7px 10px;
+.file small{display:block;font-size:11px;opacity:.75;margin-top:1px}
+button{background:#242424;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:7px 10px;
        cursor:pointer;font:inherit}
 button:hover{border-color:var(--acc)}
 button:disabled{opacity:.5;cursor:default}
-button.primary{background:var(--acc);color:#0b0d12;border:none;font-weight:600;padding:9px 14px}
+button.primary{background:var(--acc);color:#111111;border:none;font-weight:600;padding:9px 14px}
 .ctl{margin-bottom:14px}
 .ctl label{display:flex;justify-content:space-between;font-size:13px}
 .ctl label span{color:var(--acc);font-variant-numeric:tabular-nums}
 .ctl small{color:var(--dim);font-size:11.5px;display:block;margin-top:2px}
 input[type=range]{width:100%;accent-color:var(--acc)}
-input[type=text],input[type=number]{background:#0b0d12;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font:inherit}
+input[type=text],input[type=number]{background:#111111;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font:inherit}
 input[type=text]{width:100%}
 .rotrow{display:flex;gap:6px;align-items:center;margin-top:6px}
 .rotrow input[type=number]{width:84px}
@@ -374,15 +377,26 @@ input[type=text]{width:100%}
 .export .primary{width:100%}
 .export label{font-size:13px;display:block;margin:0 0 8px}
 #msg{font-size:12px;color:var(--dim);margin-top:8px;word-break:break-all}
-code{display:block;background:#0b0d12;border:1px solid var(--line);border-radius:6px;padding:8px;font-size:11px;
+code{display:block;background:#111111;border:1px solid var(--line);border-radius:6px;padding:8px;font-size:11px;
      color:var(--dim);margin-top:10px;word-break:break-all;user-select:all}
 main{display:grid;grid-template-rows:58% 42%;min-height:0;position:relative}
 .view{position:relative;display:flex;align-items:center;justify-content:center;min-height:0;padding:12px}
 #stage{position:relative;overflow:hidden;line-height:0;touch-action:none;user-select:none}
 #stage img{display:block;max-width:calc(100vw - 340px);max-height:calc(58vh - 24px)}
-#cropbox{position:absolute;border:1.5px solid var(--acc);box-shadow:0 0 0 9999px rgba(5,7,10,.62);pointer-events:none}
-#cropbox::before,#cropbox::after{content:"";position:absolute;inset:33.33% 0;border-top:1px solid #7aa2ff40;border-bottom:1px solid #7aa2ff40}
-#cropbox::after{inset:0 33.33%;border:none;border-left:1px solid #7aa2ff40;border-right:1px solid #7aa2ff40}
+#cropbox{position:absolute;border:1.5px solid var(--acc);box-shadow:0 0 0 9999px rgba(0,0,0,.62);pointer-events:none}
+#cropbox .g{position:absolute;inset:0;display:none}
+#cropbox .g::before,#cropbox .g::after{content:"";position:absolute}
+#cropbox .thirds::before{inset:33.33% 0;border-top:1px solid #d9b25f55;border-bottom:1px solid #d9b25f55}
+#cropbox .thirds::after{inset:0 33.33%;border-left:1px solid #d9b25f55;border-right:1px solid #d9b25f55}
+#cropbox .center::before{left:0;right:0;top:50%;border-top:1px dashed #ffffff80}
+#cropbox .center::after{top:0;bottom:0;left:50%;border-left:1px dashed #ffffff80}
+#cropbox[data-g=thirds] .thirds,#cropbox[data-g=both] .thirds,
+#cropbox[data-g=center] .center,#cropbox[data-g=both] .center{display:block}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:6px;overflow:hidden}
+.seg button{border:none;border-radius:0;padding:4px 9px;font-size:12px;background:transparent;color:var(--dim)}
+.seg button+button{border-left:1px solid var(--line)}
+.seg button.on{background:var(--acc);color:#111111;font-weight:600}
+.guiderow{display:flex;justify-content:space-between;align-items:center;font-size:13px;margin-top:10px}
 #marker{position:absolute;border:1px dashed #ffffffb0;pointer-events:none;display:none}
 .bottom{display:grid;grid-template-columns:1fr 1fr;border-top:1px solid var(--line);min-height:0}
 .pane{position:relative;display:flex;align-items:center;justify-content:center;min-height:0;min-width:0;padding:10px;overflow:hidden}
@@ -391,9 +405,9 @@ main{display:grid;grid-template-rows:58% 42%;min-height:0;position:relative}
 .pane>img,.pane>canvas{transition:opacity .6s}
 #res{display:block}
 #stage #orig{position:absolute;inset:0;width:100%;height:100%;max-width:none;max-height:none;z-index:3;display:none}
-#sweep{position:absolute;top:0;bottom:0;left:0;width:2px;margin-left:-1px;background:#dfe9ff;
-       box-shadow:0 0 16px 5px #7aa2ffb0;z-index:4;display:none}
-#steps{position:absolute;bottom:20px;left:50%;transform:translateX(-50%);background:#0b0d12d9;border:1px solid var(--line);
+#sweep{position:absolute;top:0;bottom:0;left:0;width:2px;margin-left:-1px;background:#ffffff;
+       box-shadow:0 0 16px 5px #d9b25fb0;z-index:4;display:none}
+#steps{position:absolute;bottom:20px;left:50%;transform:translateX(-50%);background:#111111d9;border:1px solid var(--line);
        font-size:13px;padding:7px 14px;border-radius:999px;z-index:6;display:none;white-space:nowrap}
 #steps::before{content:"";display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--acc);
                margin-right:9px;vertical-align:1px;animation:pulse 1s ease-in-out infinite alternate}
@@ -401,14 +415,28 @@ main{display:grid;grid-template-rows:58% 42%;min-height:0;position:relative}
 body.intro #cropbox,body.intro #marker{display:none!important}
 body.intro #stage{pointer-events:none}
 body.intro .pane>:not(.tag){opacity:0}
-.tag{position:absolute;top:8px;left:14px;font-size:12px;color:var(--dim);background:#0b0d12cc;padding:3px 8px;border-radius:4px;z-index:2}
-#busy{position:absolute;top:8px;right:14px;font-size:12px;color:var(--acc);display:none;z-index:2}
+.tag{position:absolute;top:8px;left:14px;font-size:12px;color:var(--dim);background:#111111cc;padding:3px 8px;border-radius:4px;z-index:2}
+#busy{position:absolute;top:8px;right:14px;font-size:12px;color:var(--text);background:#111111d9;border:1px solid var(--line);
+      padding:4px 10px 4px 8px;border-radius:999px;z-index:6;display:flex;align-items:center;gap:7px;
+      opacity:0;transition:opacity .15s;pointer-events:none}
+#busy::before{content:"";width:11px;height:11px;border-radius:50%;border:2px solid #d9b25f40;border-top-color:var(--acc);
+              animation:spin .7s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+body.rendering #busy{opacity:1;transition-delay:.12s}
+main::before{content:"";position:absolute;top:0;left:0;height:2px;width:30%;background:linear-gradient(90deg,transparent,var(--acc),transparent);
+             z-index:7;opacity:0;transition:opacity .2s;pointer-events:none;animation:scan 1.1s ease-in-out infinite}
+body.rendering main::before{opacity:1;transition-delay:.12s}
+@keyframes scan{from{left:-30%}to{left:100%}}
 #welcome{position:absolute;inset:0;background:var(--bg);display:flex;flex-direction:column;align-items:center;
          justify-content:center;gap:14px;text-align:center;padding:30px;z-index:5}
 #welcome h2{margin:0;font-size:20px;font-weight:600;color:var(--text);text-transform:none;letter-spacing:0}
 #welcome p{margin:0;color:var(--dim);max-width:460px}
+#welcome.loading p,#welcome.loading .primary{display:none}
+#welcome.loading h2{font-size:16px;font-weight:500;display:flex;align-items:center;gap:10px}
+#welcome.loading h2::before{content:"";width:14px;height:14px;border-radius:50%;border:2px solid #d9b25f40;
+                            border-top-color:var(--acc);animation:spin .7s linear infinite}
 body.dropping main::after{content:"Drop to open";position:absolute;inset:12px;border:2px dashed var(--acc);border-radius:10px;
-     background:#0b0d12e6;color:var(--acc);font-size:18px;display:flex;align-items:center;justify-content:center;z-index:10}
+     background:#111111e6;color:var(--acc);font-size:18px;display:flex;align-items:center;justify-content:center;z-index:10}
 .ctlwrap.off{opacity:.4;pointer-events:none}
 </style></head><body>
 <aside>
@@ -428,9 +456,9 @@ body.dropping main::after{content:"Drop to open";position:absolute;inset:12px;bo
     </div>
     <div class="ctl">
       <label>Crop<span id="v_crop"></span></label>
-      <div id="w_crop" class="note" style="color:#ffb35c;display:none;margin:2px 0 4px">⚠ Crop includes empty (black) corners</div>
-      <small>Drag the box edges or corners on the preview, or drag inside it to move it. Rotating resets it to the largest crop with no empty corners.</small>
+      <div id="w_crop" class="note" style="color:var(--warn);display:none;margin:2px 0 4px">⚠ Crop includes empty (black) corners</div>
       <div class="rotrow"><button id="c_reset">Reset crop</button></div>
+      <div class="guiderow">Guides<span class="seg" id="guides"><button data-g="thirds">Thirds</button><button data-g="center">Center</button><button data-g="both">Both</button><button data-g="none">None</button></span></div>
     </div>
     <h2>Tone &amp; color <button id="t_reset">Reset</button></h2>
     <div id="ctls"></div>
@@ -449,9 +477,9 @@ body.dropping main::after{content:"Drop to open";position:absolute;inset:12px;bo
       a few seconds while it crops the dead stacking edges, removes the gradient and balances color.</p>
     <button class="primary" id="open1">Open stack…</button>
   </div>
-  <div class="view"><span class="tag">Preview: drag the crop box · click to pick the 1:1 detail spot</span><span id="busy">rendering…</span>
+  <div class="view"><span class="tag">Preview: drag the crop box · click to pick the 1:1 detail spot</span><span id="busy">Rendering…</span>
     <div id="stage"><img id="prev" alt="" draggable="false"><img id="orig" alt="" draggable="false"><div id="sweep"></div>
-      <div id="cropbox"></div><div id="marker"></div></div><div id="steps"></div></div>
+      <div id="cropbox" data-g="thirds"><div class="g thirds"></div><div class="g center"></div></div><div id="marker"></div></div><div id="steps"></div></div>
   <div class="bottom">
     <div class="pane"><span class="tag">Result</span><canvas id="res"></canvas></div>
     <div class="pane"><span class="tag">1:1 detail (actual pixels)</span><img id="det" alt=""></div>
@@ -512,7 +540,7 @@ function drawCrop(){
   const ok = cropInside();
   $("v_crop").textContent = Math.round((C[2]-C[0])*W2) + " × " + Math.round((C[3]-C[1])*H2) + " px";
   $("w_crop").style.display = ok ? "none" : "block";
-  b.style.borderColor = ok ? "" : "#ffb35c";
+  b.style.borderColor = ok ? "" : "#ff7a59";
   updateCmd(); drawResult();
 }
 function drawMarker(){
@@ -559,19 +587,27 @@ const qs = extra => new URLSearchParams({...P, angle:A, cx, cy, dw:DW, dh:DH, ..
 async function request(){
   if (!loaded) return;
   if (busy){ dirty = true; return; }
-  busy = true; dirty = false; $("busy").style.display = "block";
+  busy = true; dirty = false; rendering(1);
   try{
     const q = qs();
     const [a,b] = await Promise.all([fetch("/preview?"+q), fetch("/detail?"+q)]);
     if (a.ok){ const u = URL.createObjectURL(await a.blob()); intro && !intro.revealing ? reveal(u) : ($("prev").src = u); }
     if (b.ok) $("det").src = URL.createObjectURL(await b.blob());
   } catch(e){ $("msg").textContent = "Error: " + e; }
-  busy = false; $("busy").style.display = "none";
+  busy = false; rendering(-1);
   if (dirty) request();
 }
+let pending = 0;
+function rendering(d){
+  pending += d;
+  document.body.classList.toggle("rendering", pending > 0 && !intro);
+}
 async function requestDetail(){
-  const b = await fetch("/detail?"+qs());
-  if (b.ok) $("det").src = URL.createObjectURL(await b.blob());
+  rendering(1);
+  try{
+    const b = await fetch("/detail?"+qs());
+    if (b.ok){ $("det").src = URL.createObjectURL(await b.blob()); await $("det").decode().catch(() => {}); }
+  } finally { rendering(-1); }
 }
 $("prev").addEventListener("load", () => { drawMarker(); drawResult(); });
 
@@ -650,6 +686,14 @@ $("r_0").onclick = () => setAngle(0);
 $("c_reset").onclick = () => { C = inscribed(); drawCrop(); };
 $("t_reset").onclick = () => setTone(DEF);
 $("tif").onchange = updateCmd;
+function setGuides(g){
+  $("cropbox").dataset.g = g;
+  document.querySelectorAll("#guides button").forEach(b => b.classList.toggle("on", b.dataset.g === g));
+  try{ localStorage.setItem("guides", g); } catch(e){}
+}
+document.querySelectorAll("#guides button").forEach(b => b.onclick = () => setGuides(b.dataset.g));
+let savedGuides = null; try{ savedGuides = localStorage.getItem("guides"); } catch(e){}
+setGuides(["thirds","center","both","none"].includes(savedGuides) ? savedGuides : "thirds");
 $("exp").addEventListener("click", async () => {
   $("exp").disabled = true; $("msg").textContent = "Exporting full resolution… (takes a few seconds)";
   try{
@@ -661,8 +705,13 @@ $("exp").addEventListener("click", async () => {
 });
 
 /* ---------- opening files ---------- */
+const WTEXT = $("wtext").textContent;
 function showWelcome(title, text){
-  $("welcome").style.display = "flex"; $("wtitle").textContent = title; if (text) $("wtext").textContent = text;
+  $("welcome").classList.remove("loading");
+  $("welcome").style.display = "flex"; $("wtitle").textContent = title; $("wtext").textContent = text || WTEXT;
+}
+function showLoading(step){
+  showWelcome(step); $("welcome").classList.add("loading");
 }
 function applyInfo(info){
   DEF = info.defaults;
@@ -670,7 +719,9 @@ function applyInfo(info){
   if (!info.loaded){ showWelcome("Open a stacked image"); return; }
   loaded = true; window.FILE = info.file; W = info.W; H = info.H;
   showOriginal(info.n); setStep("Stretching and bringing out color…");
-  $("file").textContent = info.name + "  (" + W + "×" + H + " after edge crop)"; $("file").title = info.file;
+  $("file").textContent = ""; $("file").title = info.file;
+  const sub = document.createElement("small"); sub.textContent = W + "×" + H + " after edge crop";
+  $("file").append(info.name, sub);
   $("welcome").style.display = "none"; $("ctlwrap").classList.remove("off");
   $("msg").textContent = ""; cx = 0.5; cy = 0.5; detailSize();
   if (!built) buildControls();
@@ -732,7 +783,7 @@ function watchLoad(){             // poll while the server loads, to show the or
       const p = await (await fetch("/progress")).json();
       if (!p.busy) return;
       if (p.orig) showOriginal(p.n);
-      if (intro) setStep(p.step); else showWelcome("Opening your image…", p.step);
+      if (intro) setStep(p.step); else showLoading(p.step || "Opening your image…");
     } catch(e){}
   }, 250);
 }
@@ -748,7 +799,7 @@ addEventListener("drop", async e => {
   const f = e.dataTransfer.files[0];
   if (!f || gone) return;
   $("open1").disabled = $("open2").disabled = true;
-  showWelcome("Opening " + f.name + "…", "Reading file…");
+  showLoading("Opening " + f.name + "…");
   watchLoad();
   try{
     const r = await fetch("/upload?name=" + encodeURIComponent(f.name), {method:"POST", body:f}); const j = await r.json();
