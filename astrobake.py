@@ -211,11 +211,11 @@ def mtf(x, m, target):
 
 
 # Default slider values ("natural"). Every look is reachable from the sliders in the UI.
-DEFAULTS = dict(stretch=900, target=0.13, sat=1.7, sky=0.075, denoise=1.3, scurve=0.12, sharpen=0.0, temp=0.0)
+DEFAULTS = dict(stretch=900, target=0.13, sat=1.7, sky=0.075, denoise=1.3, contrast=0.0, sharpen=0.0, temp=0.0, tint=0.0)
 PARAMS = tuple(DEFAULTS)
 
 
-def process(a, stretch=900., target=0.13, sat=1.7, sky=0.075, denoise=1.3, scurve=0.12, sharpen=0., temp=0.,
+def process(a, stretch=900., target=0.13, sat=1.7, sky=0.075, denoise=1.3, contrast=0., sharpen=0., temp=0., tint=0.,
             stats=None, px=1.0):
     """Non-linear processing, in place where possible.
 
@@ -247,7 +247,11 @@ def process(a, stretch=900., target=0.13, sat=1.7, sky=0.075, denoise=1.3, scurv
     a[:] = mtf(a, st["mid"], target)
 
     np.minimum(a[..., 1], (a[..., 0] + a[..., 2]) / 2, out=a[..., 1])   # SCNR green
-    a += scurve * a * (1 - a) * (2 * a - 1); np.clip(a, 0, 1, out=a)     # S-curve
+    if abs(contrast) > 0.001:   # S-curve through 0, a pivot just above the sky, and 1; slope 3**contrast at the pivot
+        k, pv = 3.0 ** contrast, min(0.5, target + 0.1)
+        for c in range(3):      # one channel at a time keeps the full-res temporaries small
+            x = np.clip(a[..., c], 0, 1)    # mtf can overshoot by a hair, and a negative base ** k is NaN
+            a[..., c] = np.where(x < pv, pv * (x / pv) ** k, 1 - (1 - pv) * ((1 - x) / (1 - pv)) ** k)
     L = a.mean(2, keepdims=True); a -= L; a *= sat; a += L; del L         # saturation
     np.clip(a, 0, 1, out=a)
 
@@ -268,6 +272,8 @@ def process(a, stretch=900., target=0.13, sat=1.7, sky=0.075, denoise=1.3, scurv
     if abs(temp) > 0.001:                        # warm/cool the object, pivoting on the sky so it stays neutral
         for c, g in ((0, 1 + 0.15 * temp), (2, 1 - 0.15 * temp)):
             a[..., c] = np.clip((a[..., c] - sky) * g + sky, 0, 1)
+    if abs(tint) > 0.001:                        # green <-> magenta, same pivot
+        a[..., 1] = np.clip((a[..., 1] - sky) * (1 - 0.12 * tint) + sky, 0, 1)
     return a
 
 
@@ -375,6 +381,9 @@ button.primary{background:var(--acc);color:#111111;border:none;font-weight:600;p
 .ctl{margin-bottom:14px}
 .ctl label{display:flex;justify-content:space-between;font-size:13px}
 .ctl label span{color:var(--acc);font-variant-numeric:tabular-nums}
+.ctl .rst{visibility:hidden;border:none;background:none;padding:0 6px;font-size:11px;color:var(--dim);margin-left:auto}
+.ctl .rst:hover{color:var(--text)}
+.ctl.mod .rst{visibility:visible}
 .ctl small{color:var(--dim);font-size:11.5px;display:block;margin-top:2px}
 input[type=range]{width:100%;accent-color:var(--acc)}
 input[type=text],input[type=number]{background:#111111;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font:inherit}
@@ -389,10 +398,10 @@ input[type=text]{width:100%}
 #msg{font-size:12px;color:var(--dim);margin-top:8px;word-break:break-all}
 code{display:block;background:#111111;border:1px solid var(--line);border-radius:6px;padding:8px;font-size:11px;
      color:var(--dim);margin-top:10px;word-break:break-all;user-select:all}
-main{display:grid;grid-template-rows:58% 42%;min-height:0;position:relative}
-.view{position:relative;display:flex;align-items:center;justify-content:center;min-height:0;padding:12px}
+main{display:grid;grid-template-columns:62% 38%;min-height:0;min-width:0;position:relative}
+.view{position:relative;display:flex;align-items:center;justify-content:center;min-height:0;min-width:0;padding:40px 12px 12px}
 #stage{position:relative;overflow:hidden;line-height:0;touch-action:none;user-select:none}
-#stage img{display:block;max-width:calc(100vw - 340px);max-height:calc(58vh - 24px)}
+#stage img{display:block;max-width:calc((100vw - 310px) * .62 - 24px);max-height:calc(100vh - 52px)}
 #cropbox{position:absolute;border:1.5px solid var(--acc);box-shadow:0 0 0 9999px rgba(0,0,0,.62);pointer-events:none}
 #cropbox .g{position:absolute;inset:0;display:none}
 #cropbox .g::before,#cropbox .g::after{content:"";position:absolute}
@@ -410,20 +419,20 @@ main{display:grid;grid-template-rows:58% 42%;min-height:0;position:relative}
 #marker{position:absolute;border:1px dashed #ffffffc0;background:#ffffff0d;pointer-events:none;display:none}
 .pane.pan{cursor:grab;touch-action:none;user-select:none}.pane.pan.grabbing{cursor:grabbing}
 #det{will-change:transform}
-.bottom{display:grid;grid-template-columns:1fr 1fr;border-top:1px solid var(--line);min-height:0}
-.pane{position:relative;display:flex;align-items:center;justify-content:center;min-height:0;min-width:0;padding:10px;overflow:hidden}
-.pane+.pane{border-left:1px solid var(--line)}
+.bottom{display:grid;grid-template-rows:1fr 1fr;border-left:1px solid var(--line);min-height:0;min-width:0}
+.pane{position:relative;display:flex;align-items:center;justify-content:center;min-height:0;min-width:0;padding:38px 10px 10px;overflow:hidden}
+.pane+.pane{border-top:1px solid var(--line)}
 .pane img{max-width:100%;max-height:100%}
-.pane>img,.pane>canvas{transition:opacity .6s}
+.pane>img,.pane>canvas,.pane>div{transition:opacity .6s}
+#detclip{overflow:hidden;line-height:0}   /* while panning, the slid image stays inside its own frame */
 #res{display:block}
 #stage #orig{position:absolute;inset:0;width:100%;height:100%;max-width:none;max-height:none;z-index:3;display:none}
 #sweep{position:absolute;top:0;bottom:0;left:0;width:2px;margin-left:-1px;background:#ffffff;
        box-shadow:0 0 16px 5px #ffffff90;z-index:4;display:none}
 #steps{position:absolute;bottom:20px;left:50%;transform:translateX(-50%);background:#111111d9;border:1px solid var(--line);
        font-size:13px;padding:7px 14px;border-radius:999px;z-index:6;display:none;white-space:nowrap}
-#steps::before{content:"";display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--acc);
-               margin-right:9px;vertical-align:1px;animation:pulse 1s ease-in-out infinite alternate}
-@keyframes pulse{from{opacity:.25}to{opacity:1}}
+#steps::before{content:"";display:inline-block;width:11px;height:11px;border-radius:50%;border:2px solid #ffffff30;
+               border-top-color:var(--acc);margin-right:9px;vertical-align:-2px;animation:spin .7s linear infinite}
 body.intro #cropbox,body.intro #marker{display:none!important}
 body.intro #stage{pointer-events:none}
 body.intro .pane>:not(.tag){opacity:0}
@@ -454,7 +463,7 @@ body.dropping main::after{content:"Drop to open";position:absolute;inset:12px;bo
 <aside>
   <h1>AstroBake <button id="quit" title="Stop AstroBake">Quit</button></h1>
   <div class="filebar"><div class="file" id="file">No image loaded</div><button id="open2">Open…</button></div>
-  <div class="ctlwrap off" id="ctlwrap">
+  <div class="ctlwrap off" id="ctlwrap" inert>
     <h2>Rotate &amp; crop</h2>
     <div class="ctl">
       <label>Rotation<span id="v_angle">0.0°</span></label>
@@ -485,8 +494,7 @@ body.dropping main::after{content:"Drop to open";position:absolute;inset:12px;bo
 <main>
   <div id="welcome">
     <h2 id="wtitle">Open a stacked image</h2>
-    <p id="wtext">Pick the TIFF straight out of DeepSkyStacker or Siril (16- or 32-bit), or drag it onto this page. The first load takes
-      a few seconds while it crops the dead stacking edges, removes the gradient and balances color.</p>
+    <p id="wtext">Pick the TIFF straight out of DeepSkyStacker or Siril (16- or 32-bit),<br>or drag it onto this page.</p>
     <button class="primary" id="open1">Open stack…</button>
   </div>
   <div class="view"><span class="tag">Preview: adjust crop · drag the dashed box to move the 1:1 detail</span><span id="busy">Rendering…</span>
@@ -494,27 +502,38 @@ body.dropping main::after{content:"Drop to open";position:absolute;inset:12px;bo
       <div id="cropbox" data-g="thirds"><div class="g thirds"></div><div class="g center"></div></div><div id="marker"></div></div><div id="steps"></div></div>
   <div class="bottom">
     <div class="pane"><span class="tag">Result</span><canvas id="res"></canvas></div>
-    <div class="pane pan" id="detpane"><span class="tag">1:1 detail (actual pixels) · drag to pan</span><img id="det" alt="" draggable="false"></div>
+    <div class="pane pan" id="detpane"><span class="tag">1:1 detail (actual pixels) · drag to pan</span><div id="detclip"><img id="det" alt="" draggable="false"></div></div>
   </div>
 </main>
 <script>
 const CTL = [
+ // tone first, then color, then fine detail: roughly biggest effect to smallest
+ // the sliders run -100..+100 with 0 = AstroBake's automatic value; min/max are the real values at the ends
  {k:"stretch", name:"Stretch strength", min:50, max:10000, log:true},
- {k:"target", name:"Brightness", min:0.05, max:0.35, step:0.005},
- {k:"sky", name:"Sky background level", min:0, max:0.2, step:0.005},
- {k:"scurve", name:"Contrast (S-curve)", min:0, max:0.35, step:0.01},
- {k:"sharpen", name:"Sharpening", min:0, max:2, step:0.05},
- {k:"sat", name:"Saturation", min:0.5, max:3, step:0.05},
- {k:"temp", name:"Color temperature", min:-1, max:1, step:0.05},
- {k:"denoise", name:"Background noise reduction", min:0, max:4, step:0.1},
+ {k:"target", name:"Brightness", min:0.05, max:0.35},
+ {k:"contrast", name:"Contrast", min:-1, max:1},
+ {k:"sky", name:"Sky background level", min:0, max:0.2},
+ {k:"sat", name:"Saturation", min:0.5, max:3},
+ {k:"temp", name:"Color temperature", min:-1, max:1},
+ {k:"tint", name:"Tint", min:-1, max:1},
+ {k:"sharpen", name:"Sharpening", min:0, max:2, amount:true},
+ {k:"denoise", name:"Background noise reduction", min:0, max:4},
 ];
 let P = {}, DEF = {}, A = 0, C = [0,0,1,1], W = 0, H = 0, W2 = 0, H2 = 0, DW = 1100, DH = 700;
 let cx = 0.5, cy = 0.5, busy = false, dirty = false, built = false, loaded = false, drag = null;
 const $ = id => document.getElementById(id);
 const clamp = (v,a,b) => Math.min(b, Math.max(a, v));
-const toSlider = (c,v) => c.log ? Math.log10(v) : v;
-const fromSlider = (c,v) => c.log ? Math.round(10**v) : +v;
-const fmt = (c,v) => c.log ? String(v) : (+v).toFixed(c.step < 0.01 ? 3 : 2);
+const lg = (c,v) => c.log ? Math.log10(v) : v, unlg = (c,v) => c.log ? 10**v : v;
+function fromSlider(c, v){         // slider position -> real setting, piecewise linear either side of the default
+  const d = lg(c,DEF[c.k]), t = v/100, r = unlg(c, t < 0 ? d + t*(d - lg(c,c.min)) : d + t*(lg(c,c.max) - d));
+  return c.log ? Math.round(r) : Math.round(r*1e4)/1e4;
+}
+function toSlider(c, r){
+  const d = lg(c,DEF[c.k]), x = lg(c,r);
+  const t = x < d ? (x - d)/(d - lg(c,c.min) || 1) : (x - d)/(lg(c,c.max) - d || 1);
+  return Math.round(clamp(t, -1, 1)*100);
+}
+const fmt = v => v > 0 ? "+" + v : String(v);
 
 /* ---------- geometry (mirrors rot_geom / inscribed_crop in Python) ---------- */
 function geom(){
@@ -579,18 +598,24 @@ function setAngle(v, keepCrop){
 
 /* ---------- tone controls ---------- */
 function buildControls(){
-  $("ctls").innerHTML = CTL.map(c => `<div class="ctl"><label>${c.name}<span id="v_${c.k}"></span></label>
-    <input type="range" id="s_${c.k}" min="${toSlider(c,c.min)}" max="${toSlider(c,c.max)}" step="${c.log?0.01:c.step}">
+  $("ctls").innerHTML = CTL.map(c => `<div class="ctl" id="c_${c.k}"><label>${c.name}<button class="rst" id="r_${c.k}"
+    title="Reset to default">Reset</button><span id="v_${c.k}"></span></label>
+    <input type="range" id="s_${c.k}" min="${c.amount ? 0 : -100}" max="100" step="1">
     ${c.help?`<small>${c.help}</small>`:""}</div>`).join("");
   CTL.forEach(c => $("s_"+c.k).addEventListener("input", e => {
-    P[c.k] = fromSlider(c, e.target.value); $("v_"+c.k).textContent = fmt(c,P[c.k]);
+    P[c.k] = fromSlider(c, e.target.value); showVal(c);
     updateCmd(); request(); }));
+  CTL.forEach(c => $("r_"+c.k).onclick = () => setTone({...P, [c.k]: DEF[c.k]}));
   built = true;
 }
 function setTone(vals){
   P = {...vals};
-  CTL.forEach(c => { $("s_"+c.k).value = toSlider(c,P[c.k]); $("v_"+c.k).textContent = fmt(c,P[c.k]); });
+  CTL.forEach(c => { $("s_"+c.k).value = toSlider(c,P[c.k]); showVal(c); });
   updateCmd(); request();
+}
+function showVal(c){
+  $("v_"+c.k).textContent = c.amount ? $("s_"+c.k).value : fmt(+$("s_"+c.k).value);
+  $("c_"+c.k).classList.toggle("mod", Math.abs(P[c.k] - DEF[c.k]) > 1e-9);
 }
 function updateCmd(){
   if (!loaded) return;
@@ -654,15 +679,15 @@ function drawResult(){
   if (!img.naturalWidth) return;
   const nw = img.naturalWidth, nh = img.naturalHeight;
   const sx = C[0]*nw, sy = C[1]*nh, sw = Math.max(1, (C[2]-C[0])*nw), sh = Math.max(1, (C[3]-C[1])*nh);
-  const k = Math.min((p.clientWidth - 20)/sw, (p.clientHeight - 20)/sh), r = devicePixelRatio || 1;
+  const k = Math.min((p.clientWidth - 20)/sw, (p.clientHeight - 48)/sh), r = devicePixelRatio || 1;
   const w = Math.max(1, Math.floor(sw*k)), h = Math.max(1, Math.floor(sh*k));
   cv.width = Math.round(w*r); cv.height = Math.round(h*r); cv.style.width = w+"px"; cv.style.height = h+"px";
   const g = cv.getContext("2d"); g.imageSmoothingQuality = "high";
   g.drawImage(img, sx, sy, sw, sh, 0, 0, cv.width, cv.height);
 }
 function detailSize(){
-  const p = $("det").parentElement;
-  DW = Math.max(64, p.clientWidth - 20); DH = Math.max(64, p.clientHeight - 20);
+  const p = $("detpane");
+  DW = Math.max(64, p.clientWidth - 20); DH = Math.max(64, p.clientHeight - 48);
 }
 let resizeT;
 addEventListener("resize", () => {
@@ -762,10 +787,10 @@ $("exp").addEventListener("click", async () => {
 });
 
 /* ---------- opening files ---------- */
-const WTEXT = $("wtext").textContent;
+const WTEXT = $("wtext").innerHTML;
 function showWelcome(title, text){
   $("welcome").classList.remove("loading");
-  $("welcome").style.display = "flex"; $("wtitle").textContent = title; $("wtext").textContent = text || WTEXT;
+  $("welcome").style.display = "flex"; $("wtitle").textContent = title; text ? $("wtext").textContent = text : $("wtext").innerHTML = WTEXT;
 }
 function showLoading(step){
   showWelcome(step); $("welcome").classList.add("loading");
@@ -773,15 +798,15 @@ function showLoading(step){
 function applyInfo(info){
   DEF = info.defaults;
   if (info.app) $("cmd").style.display = "none";      // the packaged app has no command line to paste into
+  if (!built){ buildControls(); setTone(DEF); }       // show every control (greyed out) before an image is open
   if (!info.loaded){ showWelcome("Open a stacked image"); return; }
   loaded = true; window.FILE = info.file; W = info.W; H = info.H;
   showOriginal(info.n); setStep("Stretching and bringing out color…");
   $("file").textContent = ""; $("file").title = info.file;
   const sub = document.createElement("small"); sub.textContent = W + "×" + H + " after edge crop";
   $("file").append(info.name, sub);
-  $("welcome").style.display = "none"; $("ctlwrap").classList.remove("off");
+  $("welcome").style.display = "none"; $("ctlwrap").classList.remove("off"); $("ctlwrap").inert = false;
   $("msg").textContent = ""; cx = 0.5; cy = 0.5; detailSize();
-  if (!built) buildControls();
   P = P.stretch ? P : {...DEF};
   setTone(P); setAngle(0);
 }
@@ -870,7 +895,7 @@ addEventListener("drop", async e => {
 function closed(){
   showWelcome("AstroBake has closed", "Start it again to keep working. You can close this tab.");
   gone = true; endIntro(); $("open1").style.display = "none";
-  $("ctlwrap").classList.add("off"); $("quit").disabled = $("open2").disabled = true;
+  $("ctlwrap").classList.add("off"); $("ctlwrap").inert = true; $("quit").disabled = $("open2").disabled = true;
 }
 $("quit").onclick = async () => { try{ await fetch("/quit", {method:"POST"}); } catch(e){} closed(); };
 setInterval(() => fetch("/ping").then(r => { if (!r.ok) throw 0; }).catch(closed), 20000);
@@ -1113,11 +1138,12 @@ def main():
     p.add_argument("--stretch", type=float, default=d["stretch"], help="arcsinh strength: higher = brighter faint stuff, compressed core")
     p.add_argument("--target", type=float, default=d["target"], help="midtone brightness after stretch (0.05-0.35)")
     p.add_argument("--sky", type=float, default=d["sky"], help="final sky brightness (0-0.2)")
-    p.add_argument("--scurve", type=float, default=d["scurve"], help="S-curve contrast strength (0-0.35)")
+    p.add_argument("--contrast", type=float, default=d["contrast"], help="contrast, -1 = flatter .. 1 = punchier")
     p.add_argument("--sat", type=float, default=d["sat"], help="saturation multiplier")
     p.add_argument("--denoise", type=float, default=d["denoise"], help="background blur sigma, 0 = off")
     p.add_argument("--sharpen", type=float, default=d["sharpen"], help="sharpening of bright structure (0-2), 0 = off")
     p.add_argument("--temp", type=float, default=d["temp"], help="color temperature, -1 = cooler .. 1 = warmer")
+    p.add_argument("--tint", type=float, default=d["tint"], help="tint, -1 = greener .. 1 = more magenta")
     p.add_argument("--rotate", type=float, default=0.0, help="rotation in degrees, positive = clockwise")
     p.add_argument("--crop", default=None, help="x0,y0,x1,y1 as fractions of the rotated image "
                    "(default: largest crop with no empty corners)")
