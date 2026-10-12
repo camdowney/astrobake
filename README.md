@@ -2,6 +2,12 @@
 
 Automatic processing for deep-sky stacks. Open the linear TIFF straight out of DeepSkyStacker or Siril and AstroBake crops the dead stacking edges, removes the background gradient, balances color and stretches it, with live sliders and a 1:1 preview to fine-tune the result.
 
+| Straight out of the stacker | After AstroBake |
+|---|---|
+| ![Andromeda Galaxy stack before processing: almost entirely black, the galaxy barely visible](docs/before.jpg) | ![The same stack after AstroBake: the Andromeda Galaxy with its dust lanes and companion galaxies](docs/after.jpg) |
+
+<sub>The Andromeda Galaxy (M31), stacked in DeepSkyStacker. The left side is how the stack looks in any image viewer.</sub>
+
 ## Download
 
 Grab the file for your computer from the [latest release](../../releases/latest). Nothing else to install.
