@@ -399,9 +399,9 @@ input[type=text]{width:100%}
 code{display:block;background:#111111;border:1px solid var(--line);border-radius:6px;padding:8px;font-size:11px;
      color:var(--dim);margin-top:10px;word-break:break-all;user-select:all}
 main{display:grid;grid-template-columns:62% 38%;min-height:0;min-width:0;position:relative}
-.view{position:relative;display:flex;align-items:center;justify-content:center;min-height:0;min-width:0;padding:40px 12px 12px}
+.view{position:relative;display:flex;align-items:center;justify-content:center;min-height:0;min-width:0;padding:40px 12px}   /* equal top/bottom so the image is truly centred */
 #stage{position:relative;overflow:hidden;line-height:0;touch-action:none;user-select:none}
-#stage img{display:block;max-width:calc((100vw - 310px) * .62 - 24px);max-height:calc(100vh - 52px)}
+#stage img{display:block;max-width:calc((100vw - 310px) * .62 - 24px);max-height:calc(100vh - 80px)}
 #cropbox{position:absolute;border:1.5px solid var(--acc);box-shadow:0 0 0 9999px rgba(0,0,0,.62);pointer-events:none}
 #cropbox .g{position:absolute;inset:0;display:none}
 #cropbox .g::before,#cropbox .g::after{content:"";position:absolute}
