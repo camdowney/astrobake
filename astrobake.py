@@ -185,11 +185,18 @@ def white_balance(a):
     return a
 
 
-def prepare(path, crop=True):
-    """Load + all the linear steps that don't depend on slider settings. Returns (image, stats)."""
+def prepare(path, crop=True, progress=None):
+    """Load + all the linear steps that don't depend on slider settings. Returns (image, stats).
+    `progress(step, img=None)` hears about each step, and gets the stack as loaded (still linear)."""
+    say = progress or (lambda step, img=None: None)
+    say("Reading file…")
     a = load(path)
-    if crop: a = autocrop(a)
+    if crop:
+        say("Cropping stacking edges…")
+        a = autocrop(a)
+    say("Removing background gradient…", a)
     a = remove_gradient(a)
+    say("Balancing star colors…")
     a = white_balance(a)
     noise = float(1.4826 * np.median(abs(a[::4, ::4, 1])))
     amax = float(a.max()) + 2.5 * noise
@@ -377,8 +384,23 @@ main{display:grid;grid-template-rows:58% 42%;min-height:0;position:relative}
 #cropbox::before,#cropbox::after{content:"";position:absolute;inset:33.33% 0;border-top:1px solid #7aa2ff40;border-bottom:1px solid #7aa2ff40}
 #cropbox::after{inset:0 33.33%;border:none;border-left:1px solid #7aa2ff40;border-right:1px solid #7aa2ff40}
 #marker{position:absolute;border:1px dashed #ffffffb0;pointer-events:none;display:none}
-.detail{border-top:1px solid var(--line);display:flex;align-items:center;justify-content:center;min-height:0;padding:10px;position:relative}
-.detail img{max-width:100%;max-height:100%}
+.bottom{display:grid;grid-template-columns:1fr 1fr;border-top:1px solid var(--line);min-height:0}
+.pane{position:relative;display:flex;align-items:center;justify-content:center;min-height:0;min-width:0;padding:10px;overflow:hidden}
+.pane+.pane{border-left:1px solid var(--line)}
+.pane img{max-width:100%;max-height:100%}
+.pane>img,.pane>canvas{transition:opacity .6s}
+#res{display:block}
+#stage #orig{position:absolute;inset:0;width:100%;height:100%;max-width:none;max-height:none;z-index:3;display:none}
+#sweep{position:absolute;top:0;bottom:0;left:0;width:2px;margin-left:-1px;background:#dfe9ff;
+       box-shadow:0 0 16px 5px #7aa2ffb0;z-index:4;display:none}
+#steps{position:absolute;bottom:20px;left:50%;transform:translateX(-50%);background:#0b0d12d9;border:1px solid var(--line);
+       font-size:13px;padding:7px 14px;border-radius:999px;z-index:6;display:none;white-space:nowrap}
+#steps::before{content:"";display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--acc);
+               margin-right:9px;vertical-align:1px;animation:pulse 1s ease-in-out infinite alternate}
+@keyframes pulse{from{opacity:.25}to{opacity:1}}
+body.intro #cropbox,body.intro #marker{display:none!important}
+body.intro #stage{pointer-events:none}
+body.intro .pane>:not(.tag){opacity:0}
 .tag{position:absolute;top:8px;left:14px;font-size:12px;color:var(--dim);background:#0b0d12cc;padding:3px 8px;border-radius:4px;z-index:2}
 #busy{position:absolute;top:8px;right:14px;font-size:12px;color:var(--acc);display:none;z-index:2}
 #welcome{position:absolute;inset:0;background:var(--bg);display:flex;flex-direction:column;align-items:center;
@@ -428,8 +450,12 @@ body.dropping main::after{content:"Drop to open";position:absolute;inset:12px;bo
     <button class="primary" id="open1">Open stack…</button>
   </div>
   <div class="view"><span class="tag">Preview: drag the crop box · click to pick the 1:1 detail spot</span><span id="busy">rendering…</span>
-    <div id="stage"><img id="prev" alt="" draggable="false"><div id="cropbox"></div><div id="marker"></div></div></div>
-  <div class="detail"><span class="tag">1:1 detail (actual pixels)</span><img id="det" alt=""></div>
+    <div id="stage"><img id="prev" alt="" draggable="false"><img id="orig" alt="" draggable="false"><div id="sweep"></div>
+      <div id="cropbox"></div><div id="marker"></div></div><div id="steps"></div></div>
+  <div class="bottom">
+    <div class="pane"><span class="tag">Result</span><canvas id="res"></canvas></div>
+    <div class="pane"><span class="tag">1:1 detail (actual pixels)</span><img id="det" alt=""></div>
+  </div>
 </main>
 <script>
 const CTL = [
@@ -487,7 +513,7 @@ function drawCrop(){
   $("v_crop").textContent = Math.round((C[2]-C[0])*W2) + " × " + Math.round((C[3]-C[1])*H2) + " px";
   $("w_crop").style.display = ok ? "none" : "block";
   b.style.borderColor = ok ? "" : "#ffb35c";
-  updateCmd();
+  updateCmd(); drawResult();
 }
 function drawMarker(){
   const m = $("marker"); if (!$("prev").naturalWidth) return;
@@ -526,7 +552,7 @@ function updateCmd(){
   if (C.some((v,i) => Math.abs(v - [0,0,1,1][i]) > 1e-4)) s += ` --crop ${C.map(v => v.toFixed(4)).join(",")}`;
   $("cmd").textContent = s;
 }
-const qs = extra => new URLSearchParams({...P, angle:A, cx, cy, ...(extra||{})}).toString();
+const qs = extra => new URLSearchParams({...P, angle:A, cx, cy, dw:DW, dh:DH, ...(extra||{})}).toString();
 
 /* ---------- rendering ---------- */
 async function request(){
@@ -536,7 +562,7 @@ async function request(){
   try{
     const q = qs();
     const [a,b] = await Promise.all([fetch("/preview?"+q), fetch("/detail?"+q)]);
-    if (a.ok) $("prev").src = URL.createObjectURL(await a.blob());
+    if (a.ok){ const u = URL.createObjectURL(await a.blob()); intro && !intro.revealing ? reveal(u) : ($("prev").src = u); }
     if (b.ok) $("det").src = URL.createObjectURL(await b.blob());
   } catch(e){ $("msg").textContent = "Error: " + e; }
   busy = false; $("busy").style.display = "none";
@@ -546,7 +572,30 @@ async function requestDetail(){
   const b = await fetch("/detail?"+qs());
   if (b.ok) $("det").src = URL.createObjectURL(await b.blob());
 }
-$("prev").addEventListener("load", drawMarker);
+$("prev").addEventListener("load", () => { drawMarker(); drawResult(); });
+
+/* ---------- bottom panes: clean cropped result, and a 1:1 detail sized to its pane ---------- */
+function drawResult(){
+  const img = $("prev"), cv = $("res"), p = cv.parentElement;
+  if (!img.naturalWidth) return;
+  const nw = img.naturalWidth, nh = img.naturalHeight;
+  const sx = C[0]*nw, sy = C[1]*nh, sw = Math.max(1, (C[2]-C[0])*nw), sh = Math.max(1, (C[3]-C[1])*nh);
+  const k = Math.min((p.clientWidth - 20)/sw, (p.clientHeight - 20)/sh), r = devicePixelRatio || 1;
+  const w = Math.max(1, Math.floor(sw*k)), h = Math.max(1, Math.floor(sh*k));
+  cv.width = Math.round(w*r); cv.height = Math.round(h*r); cv.style.width = w+"px"; cv.style.height = h+"px";
+  const g = cv.getContext("2d"); g.imageSmoothingQuality = "high";
+  g.drawImage(img, sx, sy, sw, sh, 0, 0, cv.width, cv.height);
+}
+function detailSize(){
+  const p = $("det").parentElement;
+  DW = Math.max(64, p.clientWidth - 20); DH = Math.max(64, p.clientHeight - 20);
+}
+let resizeT;
+addEventListener("resize", () => {
+  if (!loaded) return;
+  detailSize(); drawResult(); drawMarker();
+  clearTimeout(resizeT); resizeT = setTimeout(requestDetail, 250);
+});
 
 /* ---------- crop box interaction ---------- */
 const stage = $("stage"), MIN = 0.03;
@@ -617,10 +666,11 @@ function applyInfo(info){
   DEF = info.defaults;
   if (info.app) $("cmd").style.display = "none";      // the packaged app has no command line to paste into
   if (!info.loaded){ showWelcome("Open a stacked image"); return; }
-  loaded = true; window.FILE = info.file; W = info.W; H = info.H; DW = info.DW; DH = info.DH;
+  loaded = true; window.FILE = info.file; W = info.W; H = info.H;
+  showOriginal(info.n); setStep("Stretching and bringing out color…");
   $("file").textContent = info.name + "  (" + W + "×" + H + " after edge crop)"; $("file").title = info.file;
   $("welcome").style.display = "none"; $("ctlwrap").classList.remove("off");
-  $("msg").textContent = ""; cx = 0.5; cy = 0.5;
+  $("msg").textContent = ""; cx = 0.5; cy = 0.5; detailSize();
   if (!built) buildControls();
   P = P.stretch ? P : {...DEF};
   setTone(P); setAngle(0);
@@ -628,16 +678,63 @@ function applyInfo(info){
 async function openWith(url){
   $("open1").disabled = $("open2").disabled = true;
   showWelcome("Choose a file…", "A file picker window should have opened (it can hide behind the browser).");
+  watchLoad();
   try{
-    const r = await fetch(url, {method:"POST"}); const j = await r.json();
+    const r = await fetch(url, {method:"POST"}); const j = await r.json(); stopWatch();
+    if (j.error) endIntro();
     if (j.error === "nodialog")
       showWelcome("Drag your image here", "No file picker is available on this computer. Drag your stacked TIFF onto this page instead.");
     else if (j.error) showWelcome("Couldn't open that file", j.error);
     else if (j.cancelled){ loaded ? $("welcome").style.display = "none" : showWelcome("Open a stacked image"); }
     else applyInfo(j);
-  } catch(e){ showWelcome("Error", String(e)); }
+  } catch(e){ stopWatch(); endIntro(); showWelcome("Error", String(e)); }
   $("open1").disabled = $("open2").disabled = false;
 }
+
+/* ---------- first look: show the stack as it really is, then sweep the result across it ---------- */
+let intro = null, watcher = null;   // intro = {n, t0, revealing} while the original is on screen
+function showOriginal(n){
+  if (n == null || (intro && intro.n === n)) return;
+  const u = "/original?n=" + n;
+  intro = {n, t0: performance.now(), revealing: false};
+  document.body.classList.add("intro");
+  $("orig").style.clipPath = "none"; $("orig").src = u; $("prev").src = u; $("orig").style.display = "block";
+  $("welcome").style.display = "none";
+}
+function setStep(t){ $("steps").textContent = t || ""; $("steps").style.display = t ? "block" : "none"; }
+function endIntro(){
+  intro = null; document.body.classList.remove("intro");
+  $("orig").style.display = $("sweep").style.display = "none"; setStep("");
+  drawMarker();
+}
+async function reveal(url){
+  intro.revealing = true;
+  const wait = 1200 - (performance.now() - intro.t0);         // give the original a moment on screen
+  if (wait > 0) await new Promise(r => setTimeout(r, wait));
+  $("prev").src = url; try{ await $("prev").decode(); } catch(e){}
+  setStep("");
+  if (matchMedia("(prefers-reduced-motion: reduce)").matches) return endIntro();
+  const o = $("orig").style, s = $("sweep").style, T = 1700, t0 = performance.now();
+  s.display = "block";
+  await new Promise(done => requestAnimationFrame(function frame(now){
+    const t = Math.min(1, Math.max(0, now - t0) / T), e = t < .5 ? 4*t*t*t : 1 - (2 - 2*t)**3 / 2;   // ease in-out
+    o.clipPath = `inset(0 0 0 ${e*100}%)`; s.left = e*100 + "%";
+    t < 1 ? requestAnimationFrame(frame) : done();
+  }));
+  endIntro();
+}
+function watchLoad(){             // poll while the server loads, to show the original and each step
+  clearInterval(watcher);
+  watcher = setInterval(async () => {
+    try{
+      const p = await (await fetch("/progress")).json();
+      if (!p.busy) return;
+      if (p.orig) showOriginal(p.n);
+      if (intro) setStep(p.step); else showWelcome("Opening your image…", p.step);
+    } catch(e){}
+  }, 250);
+}
+function stopWatch(){ clearInterval(watcher); }
 $("open1").onclick = $("open2").onclick = () => openWith("/open");
 
 /* ---------- drag and drop: the browser only gives us the file's contents, so upload them ---------- */
@@ -649,18 +746,20 @@ addEventListener("drop", async e => {
   const f = e.dataTransfer.files[0];
   if (!f || gone) return;
   $("open1").disabled = $("open2").disabled = true;
-  showWelcome("Loading " + f.name + "…", "Cropping edges, removing gradient, balancing color.");
+  showWelcome("Opening " + f.name + "…", "Reading file…");
+  watchLoad();
   try{
     const r = await fetch("/upload?name=" + encodeURIComponent(f.name), {method:"POST", body:f}); const j = await r.json();
-    if (j.error) showWelcome("Couldn't open that file", j.error); else applyInfo(j);
-  } catch(e){ showWelcome("Error", String(e)); }
+    stopWatch();
+    if (j.error){ endIntro(); showWelcome("Couldn't open that file", j.error); } else applyInfo(j);
+  } catch(e){ stopWatch(); endIntro(); showWelcome("Error", String(e)); }
   $("open1").disabled = $("open2").disabled = false;
 });
 
 /* ---------- lifetime: tell the server we're here, and when we leave ---------- */
 function closed(){
   showWelcome("AstroBake has closed", "Start it again to keep working. You can close this tab.");
-  gone = true; $("open1").style.display = "none";
+  gone = true; endIntro(); $("open1").style.display = "none";
   $("ctlwrap").classList.add("off"); $("quit").disabled = $("open2").disabled = true;
 }
 $("quit").onclick = async () => { try{ await fetch("/quit", {method:"POST"}); } catch(e){} closed(); };
@@ -697,12 +796,23 @@ def run_ui(path=None, crop=True, port=8765, open_browser=True, out=None, auto_qu
     lock = threading.Lock()
     DW, DH = 1100, 700                     # 1:1 detail window size (pixels)
     seen = {"last": time.monotonic(), "bye": None}
+    prog = {"n": 0, "busy": False, "step": None, "orig": None}   # the load in progress, polled by the page
 
     def load_image(p, name=None):
         """Load a file from disk, or (with `name`) a temporary copy of a file dropped onto the page.
         A dropped file's real location is unknown to the browser, so its exports go to Downloads."""
         print(f"\nLoading {name or p}\nPreparing image (crop, gradient removal, white balance)…")
-        full, base = prepare(p, crop)
+        prog.update(n=prog["n"] + 1, busy=True, step=None, orig=None)
+
+        def report(step, img=None):
+            prog["step"] = step
+            if img is not None:   # the stack as it really looks, shown while the rest runs
+                k = max(1, math.ceil(max(img.shape[:2]) / 1600))
+                prog["orig"] = jpeg_bytes(img[::k, ::k])
+        try:
+            full, base = prepare(p, crop, report)
+        finally:
+            prog["busy"] = False
         H, W, _ = full.shape
         k = max(1, math.ceil(max(W, H) / 1600))
         S.clear(); gc.collect()
@@ -712,12 +822,12 @@ def run_ui(path=None, crop=True, port=8765, open_browser=True, out=None, auto_qu
         else:
             S.update(path=os.path.abspath(p), name=os.path.basename(p), dir=os.path.dirname(os.path.abspath(p)),
                      out=out if (out and p == path) else os.path.splitext(p)[0] + "_processed")
-        S.update(full=full, base=base, W=W, H=H, k=k,
+        S.update(full=full, base=base, W=W, H=H, k=k, n=prog["n"], orig=prog["orig"],
                  prev=np.ascontiguousarray(full[::k, ::k]))   # strided: keeps real per-pixel noise
         print("ready")
 
     def info():
-        d = {"loaded": S.get("path") is not None, "defaults": DEFAULTS, "app": FROZEN}
+        d = {"loaded": S.get("path") is not None, "defaults": DEFAULTS, "app": FROZEN, "n": S.get("n")}
         if d["loaded"]:
             d.update(file=S["path"], name=S["name"], W=S["W"], H=S["H"], DW=DW, DH=DH)
         return d
@@ -733,11 +843,11 @@ def run_ui(path=None, crop=True, port=8765, open_browser=True, out=None, auto_qu
         sp = dict(s); sp["denoise"] = s["denoise"] / S["k"]      # blur scales with preview size
         return process(S["prev"].copy(), stats=st, **sp), st
 
-    def render_detail(s, angle, cx, cy):
-        """1:1 window of the rotated full-res image, centred on (cx, cy) of the rotated canvas."""
+    def render_detail(s, angle, cx, cy, dw=DW, dh=DH):
+        """dw x dh window of the rotated full-res image at 1:1, centred on (cx, cy) of the rotated canvas."""
         W, H = S["W"], S["H"]
         M, W2, H2 = rot_geom(W, H, angle)
-        dw, dh = min(DW, W2), min(DH, H2)
+        dw, dh = min(dw, W2), min(dh, H2)
         x0 = int(np.clip(cx * W2 - dw / 2, 0, W2 - dw)); y0 = int(np.clip(cy * H2 - dh / 2, 0, H2 - dh))
         Minv = cv2.invertAffineTransform(M)
         pts = np.array([[x0, y0, 1], [x0 + dw, y0, 1], [x0, y0 + dh, 1], [x0 + dw, y0 + dh, 1]], float)
@@ -780,6 +890,12 @@ def run_ui(path=None, crop=True, port=8765, open_browser=True, out=None, auto_qu
                     return self.send_json(info())
                 if u.path == "/ping":
                     return self.send(b"ok", "text/plain")
+                if u.path == "/progress":
+                    return self.send_json({k: prog[k] for k in ("n", "busy", "step")} | {"orig": prog["orig"] is not None})
+                if u.path == "/original":
+                    n = int(num(q, "n", -1))
+                    img = prog["orig"] if n == prog["n"] else S.get("orig") if n == S.get("n") else None
+                    return self.send(img, "image/jpeg") if img else self.send(b"gone", "text/plain", 404)
                 if not S.get("path"):
                     return self.send(b"no image loaded", "text/plain", 409)
                 if u.path == "/preview":
@@ -789,7 +905,8 @@ def run_ui(path=None, crop=True, port=8765, open_browser=True, out=None, auto_qu
                     return self.send(jpeg_bytes(img), "image/jpeg")
                 if u.path == "/detail":
                     with lock:
-                        img = render_detail(params(q), num(q, "angle"), num(q, "cx", .5), num(q, "cy", .5))
+                        size = (int(np.clip(num(q, k, d), 64, 2400)) for k, d in (("dw", DW), ("dh", DH)))
+                        img = render_detail(params(q), num(q, "angle"), num(q, "cx", .5), num(q, "cy", .5), *size)
                     return self.send(jpeg_bytes(img, 92), "image/jpeg")
                 self.send(b"not found", "text/plain", 404)
             except Exception as e:
