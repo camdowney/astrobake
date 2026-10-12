@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-astro_autoprocess.py - automatic processing of a linear DSS/Siril stack,
+astrobake.py - automatic processing of a linear DSS/Siril stack,
 with a local web UI (sliders + live preview) or straight from the command line.
 
 Steps: crop dead stacking edges -> remove background gradient -> neutralize sky
@@ -8,42 +8,83 @@ Steps: crop dead stacking edges -> remove background gradient -> neutralize sky
 + midtone stretch -> SCNR green removal -> S-curve -> saturation -> background
 noise reduction -> final sky neutralization -> rotate -> crop.
 
-Start:    double-click "Astro Processor.bat" (Windows), or drag a TIFF onto it
-          python astro_autoprocess.py                       # UI, pick a file in the page
-          python astro_autoprocess.py stacked.tif           # UI with that file loaded
-Batch:    python astro_autoprocess.py stacked.tif --batch   # default settings straight to files
-          python astro_autoprocess.py stacked.tif --batch --stretch 4000 --rotate 12.5
+Start:    double-click "AstroBake.bat" (Windows), or drag a TIFF onto it
+          python astrobake.py                          # UI, pick a file in the page
+          python astrobake.py stacked.tif              # UI with that file loaded
+Batch:    python astrobake.py stacked.tif --batch      # default settings straight to files
+          python astrobake.py stacked.tif --batch --stretch 4000 --rotate 12.5
           (the UI shows the exact --batch command for whatever you've dialed in)
-Packages: numpy tifffile imagecodecs opencv-python-headless pillow (it offers to install them)
+Packages: numpy tifffile imagecodecs opencv-python-headless pillow (it offers to install them,
+          in a private .venv if the system Python is locked or has no pip)
 Outputs:  <name>_processed_16bit.tif (for further editing in GIMP) and <name>_processed.jpg,
           next to the input file.
 Needs roughly 6x the image size in RAM (about 2 GB for a 24 MP stack).
 """
-import sys, importlib.util, subprocess
+import sys, importlib.util, os, shutil, subprocess
 
 # ---------------------------------------------------------------- dependency check
 REQUIRED = {"numpy": "numpy", "tifffile": "tifffile", "imagecodecs": "imagecodecs",
             "cv2": "opencv-python-headless", "PIL": "pillow"}
 _missing = [pkg for mod, pkg in REQUIRED.items() if importlib.util.find_spec(mod) is None]
-if _missing:
-    cmd = [sys.executable, "-m", "pip", "install", *_missing]
-    print("Astro Processor needs some Python packages that aren't installed:\n    " + ", ".join(_missing))
-    answer = ""
-    if sys.stdin and sys.stdin.isatty():
-        try: answer = input("\nInstall them now? [Y/n] ").strip().lower()
-        except EOFError: answer = "n"
-    else:
-        answer = "n"
-    if answer in ("", "y", "yes"):
-        if subprocess.call(cmd) == 0:
-            print("\nInstalled. Starting…\n")
-            sys.exit(subprocess.call([sys.executable, *sys.argv]))   # restart with packages available
-        print("\nInstall failed - see the error above.")
-    print("\nTo install manually, run:\n\n    " + subprocess.list2cmdline(cmd) + "\n")
-    print("(On some Linux distros add --break-system-packages, or use a virtualenv.)")
-    sys.exit(1)
+_here = os.path.dirname(os.path.abspath(__file__))
+_venv = os.path.join(_here, ".venv")
+_venv_py = os.path.join(_venv, "Scripts", "python.exe") if os.name == "nt" else os.path.join(_venv, "bin", "python")
+if _missing and os.path.exists(_venv_py) and os.path.abspath(sys.prefix) != _venv:
+    # packages live in the project's virtualenv - rerun with that Python
+    sys.exit(subprocess.call([_venv_py, os.path.abspath(__file__), *sys.argv[1:]]))
 
-import argparse, gc, io, json, math, os, threading, webbrowser
+
+def _ask(question):
+    if not (sys.stdin and sys.stdin.isatty()): return False
+    try: return input(question).strip().lower() in ("", "y", "yes")
+    except EOFError: return False
+
+
+def _system_pip_usable():
+    """pip exists and the OS allows installing into this Python (PEP 668 locks many distros' Pythons)."""
+    import sysconfig
+    if importlib.util.find_spec("pip") is None: return False
+    locked = os.path.exists(os.path.join(sysconfig.get_path("stdlib"), "EXTERNALLY-MANAGED"))
+    return sys.prefix != sys.base_prefix or not locked
+
+
+if _missing:
+    rerun = subprocess.list2cmdline([os.path.basename(sys.executable), os.path.relpath(__file__)])
+    print("AstroBake needs some Python packages that aren't installed:\n    " + ", ".join(_missing))
+    if _system_pip_usable():
+        cmd = [sys.executable, "-m", "pip", "install", *_missing]
+        if _ask("\nInstall them now? [Y/n] "):
+            if subprocess.call(cmd) == 0:
+                print("\nInstalled. Starting…\n")
+                sys.exit(subprocess.call([sys.executable, *sys.argv]))   # restart with packages available
+            print("\nInstall failed - see the error above.")
+        print("\nTo install manually, run:\n\n    " + subprocess.list2cmdline(cmd) + "\n")
+        sys.exit(1)
+
+    # this Python can't take packages directly, so give AstroBake its own virtual environment
+    rel = os.path.relpath(_venv)
+    print(f"\nAstroBake can install them into its own virtual environment ({rel}),"
+          " leaving your system Python untouched.")
+    if not _ask("Set it up now? [Y/n] "):
+        print(f"\nRun {rerun} again in a terminal and answer Y to set it up.\n")
+        sys.exit(1)
+    existed = os.path.exists(_venv)
+    if subprocess.call([sys.executable, "-m", "venv", _venv]) != 0:
+        if not existed: shutil.rmtree(_venv, ignore_errors=True)   # don't leave a half-made venv behind
+        print("\nCouldn't create the virtual environment: Python's venv support isn't installed.")
+        if shutil.which("apt"):
+            print("Install it with:\n\n    sudo apt install python3-venv\n")
+        else:
+            print("Install your system's python3-venv package (or equivalent).\n")
+        print(f"Then run AstroBake again:\n\n    {rerun}\n")
+        sys.exit(1)
+    if subprocess.call([_venv_py, "-m", "pip", "install", *_missing]) != 0:
+        print(f"\nInstall failed - see the error above. Once it's fixed, run AstroBake again:\n\n    {rerun}\n")
+        sys.exit(1)
+    print("\nInstalled. Starting…\n")
+    sys.exit(subprocess.call([_venv_py, os.path.abspath(__file__), *sys.argv[1:]]))
+
+import argparse, gc, io, json, math, threading, webbrowser
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 import numpy as np, tifffile, cv2
@@ -277,7 +318,7 @@ def render_full(full, base_stats, settings, angle=0.0, crop=None):
 # ---------------------------------------------------------------- web UI
 UI_HTML = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Astro Processor</title>
+<title>AstroBake</title>
 <style>
 :root{--bg:#0b0d12;--panel:#141821;--line:#262c38;--text:#dfe4ee;--dim:#8a93a6;--acc:#7aa2ff;}
 *{box-sizing:border-box}
@@ -332,7 +373,7 @@ main{display:grid;grid-template-rows:58% 42%;min-height:0;position:relative}
 .ctlwrap.off{opacity:.4;pointer-events:none}
 </style></head><body>
 <aside>
-  <h1>Astro Processor</h1>
+  <h1>AstroBake</h1>
   <div class="filebar"><div class="file" id="file">No image loaded</div><button id="open2">Open…</button></div>
   <div class="ctlwrap off" id="ctlwrap">
     <h2>Rotate &amp; crop</h2>
@@ -464,7 +505,7 @@ function setTone(vals){
 }
 function updateCmd(){
   if (!loaded) return;
-  let s = `python astro_autoprocess.py "${window.FILE}" --batch ` + CTL.map(c => `--${c.k} ${P[c.k]}`).join(" ");
+  let s = `python astrobake.py "${window.FILE}" --batch ` + CTL.map(c => `--${c.k} ${P[c.k]}`).join(" ");
   if (A) s += ` --rotate ${A}`;
   if (C.some((v,i) => Math.abs(v - [0,0,1,1][i]) > 1e-4)) s += ` --crop ${C.map(v => v.toFixed(4)).join(",")}`;
   $("cmd").textContent = s;
@@ -744,7 +785,7 @@ def run_ui(path=None, crop=True, port=8765, open_browser=True, out=None):
     if srv is None:
         sys.exit(f"No free port between {port} and {port + 19}")
     url = f"http://127.0.0.1:{srv.server_address[1]}/"
-    print(f"\nAstro Processor running at {url}")
+    print(f"\nAstroBake running at {url}")
     print("Leave this window open while you use it. Close it (or press Ctrl+C) to quit.")
     if open_browser:
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()
