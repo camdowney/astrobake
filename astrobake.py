@@ -385,7 +385,8 @@ main{display:grid;grid-template-rows:58% 42%;min-height:0;position:relative}
          justify-content:center;gap:14px;text-align:center;padding:30px;z-index:5}
 #welcome h2{margin:0;font-size:20px;font-weight:600;color:var(--text);text-transform:none;letter-spacing:0}
 #welcome p{margin:0;color:var(--dim);max-width:460px}
-#pathbox{display:none;width:min(520px,90%)}
+body.dropping main::after{content:"Drop to open";position:absolute;inset:12px;border:2px dashed var(--acc);border-radius:10px;
+     background:#0b0d12e6;color:var(--acc);font-size:18px;display:flex;align-items:center;justify-content:center;z-index:10}
 .ctlwrap.off{opacity:.4;pointer-events:none}
 </style></head><body>
 <aside>
@@ -422,10 +423,9 @@ main{display:grid;grid-template-rows:58% 42%;min-height:0;position:relative}
 <main>
   <div id="welcome">
     <h2 id="wtitle">Open a stacked image</h2>
-    <p id="wtext">Pick the TIFF straight out of DeepSkyStacker or Siril (16- or 32-bit). The first load takes
+    <p id="wtext">Pick the TIFF straight out of DeepSkyStacker or Siril (16- or 32-bit), or drag it onto this page. The first load takes
       a few seconds while it crops the dead stacking edges, removes the gradient and balances color.</p>
     <button class="primary" id="open1">Open stack…</button>
-    <div id="pathbox"><input type="text" id="pathin" placeholder="Paste the full path to your .tif and press Enter"></div>
   </div>
   <div class="view"><span class="tag">Preview: drag the crop box · click to pick the 1:1 detail spot</span><span id="busy">rendering…</span>
     <div id="stage"><img id="prev" alt="" draggable="false"><div id="cropbox"></div><div id="marker"></div></div></div>
@@ -630,10 +630,9 @@ async function openWith(url){
   showWelcome("Choose a file…", "A file picker window should have opened (it can hide behind the browser).");
   try{
     const r = await fetch(url, {method:"POST"}); const j = await r.json();
-    if (j.error === "nodialog"){
-      showWelcome("Open a stacked image", "No native file picker available here, so paste the file path instead.");
-      $("pathbox").style.display = "block";
-    } else if (j.error){ showWelcome("Couldn't open that file", j.error); $("pathbox").style.display = "block"; }
+    if (j.error === "nodialog")
+      showWelcome("Drag your image here", "No file picker is available on this computer. Drag your stacked TIFF onto this page instead.");
+    else if (j.error) showWelcome("Couldn't open that file", j.error);
     else if (j.cancelled){ loaded ? $("welcome").style.display = "none" : showWelcome("Open a stacked image"); }
     else applyInfo(j);
   } catch(e){ showWelcome("Error", String(e)); }
@@ -641,24 +640,39 @@ async function openWith(url){
 }
 $("open1").onclick = $("open2").onclick = () => openWith("/open");
 
+/* ---------- drag and drop: the browser only gives us the file's contents, so upload them ---------- */
+let gone = false;
+addEventListener("dragover", e => { e.preventDefault(); if (!gone) document.body.classList.add("dropping"); });
+addEventListener("dragleave", e => { if (!e.relatedTarget) document.body.classList.remove("dropping"); });
+addEventListener("drop", async e => {
+  e.preventDefault(); document.body.classList.remove("dropping");
+  const f = e.dataTransfer.files[0];
+  if (!f || gone) return;
+  $("open1").disabled = $("open2").disabled = true;
+  showWelcome("Loading " + f.name + "…", "Cropping edges, removing gradient, balancing color.");
+  try{
+    const r = await fetch("/upload?name=" + encodeURIComponent(f.name), {method:"POST", body:f}); const j = await r.json();
+    if (j.error) showWelcome("Couldn't open that file", j.error); else applyInfo(j);
+  } catch(e){ showWelcome("Error", String(e)); }
+  $("open1").disabled = $("open2").disabled = false;
+});
+
 /* ---------- lifetime: tell the server we're here, and when we leave ---------- */
 function closed(){
   showWelcome("AstroBake has closed", "Start it again to keep working. You can close this tab.");
-  $("open1").style.display = "none"; $("pathbox").style.display = "none";
+  gone = true; $("open1").style.display = "none";
   $("ctlwrap").classList.add("off"); $("quit").disabled = $("open2").disabled = true;
 }
 $("quit").onclick = async () => { try{ await fetch("/quit", {method:"POST"}); } catch(e){} closed(); };
 setInterval(() => fetch("/ping").then(r => { if (!r.ok) throw 0; }).catch(closed), 20000);
 addEventListener("pagehide", () => navigator.sendBeacon("/bye"));
-$("pathin").addEventListener("keydown", e => {
-  if (e.key === "Enter" && e.target.value.trim()){
-    const p = e.target.value.trim().replace(/^"|"$/g, "");
-    showWelcome("Loading…", "Cropping edges, removing gradient, balancing color.");
-    openWith("/load?path=" + encodeURIComponent(p));
-  }
-});
 (async () => { applyInfo(await (await fetch("/info")).json()); })();
 </script></body></html>"""
+
+def downloads_dir():
+    d = os.path.join(os.path.expanduser("~"), "Downloads")
+    return d if os.path.isdir(d) else os.path.expanduser("~")
+
 
 def pick_file(initial_dir=""):
     """Native file dialog, run in a subprocess so it works from the server thread on every OS.
@@ -684,21 +698,28 @@ def run_ui(path=None, crop=True, port=8765, open_browser=True, out=None, auto_qu
     DW, DH = 1100, 700                     # 1:1 detail window size (pixels)
     seen = {"last": time.monotonic(), "bye": None}
 
-    def load_image(p):
-        print(f"\nLoading {p}\nPreparing image (crop, gradient removal, white balance)…")
+    def load_image(p, name=None):
+        """Load a file from disk, or (with `name`) a temporary copy of a file dropped onto the page.
+        A dropped file's real location is unknown to the browser, so its exports go to Downloads."""
+        print(f"\nLoading {name or p}\nPreparing image (crop, gradient removal, white balance)…")
         full, base = prepare(p, crop)
         H, W, _ = full.shape
         k = max(1, math.ceil(max(W, H) / 1600))
         S.clear(); gc.collect()
-        S.update(path=os.path.abspath(p), full=full, base=base, W=W, H=H, k=k,
-                 prev=np.ascontiguousarray(full[::k, ::k]),   # strided: keeps real per-pixel noise
-                 out=out if (out and p == path) else os.path.splitext(p)[0] + "_processed")
+        if name:
+            stem = os.path.splitext(name)[0]
+            S.update(path=name, name=name, dir=None, out=os.path.join(downloads_dir(), stem + "_processed"))
+        else:
+            S.update(path=os.path.abspath(p), name=os.path.basename(p), dir=os.path.dirname(os.path.abspath(p)),
+                     out=out if (out and p == path) else os.path.splitext(p)[0] + "_processed")
+        S.update(full=full, base=base, W=W, H=H, k=k,
+                 prev=np.ascontiguousarray(full[::k, ::k]))   # strided: keeps real per-pixel noise
         print("ready")
 
     def info():
         d = {"loaded": S.get("path") is not None, "defaults": DEFAULTS, "app": FROZEN}
         if d["loaded"]:
-            d.update(file=S["path"], name=os.path.basename(S["path"]), W=S["W"], H=S["H"], DW=DW, DH=DH)
+            d.update(file=S["path"], name=S["name"], W=S["W"], H=S["H"], DW=DW, DH=DH)
         return d
 
     def params(q):
@@ -783,18 +804,28 @@ def run_ui(path=None, crop=True, port=8765, open_browser=True, out=None, auto_qu
                 if u.path == "/quit":
                     self.send(b"ok", "text/plain")
                     return threading.Thread(target=srv.shutdown).start()
-                if u.path in ("/open", "/load"):
-                    if u.path == "/open":
-                        start = os.path.dirname(S["path"]) if S.get("path") else \
-                            (os.path.expanduser("~") if FROZEN else os.getcwd())
-                        p = pick_file(start)
-                        if p is None: return self.send_json({"error": "nodialog"})
-                        if p == "": return self.send_json({"cancelled": True})
-                    else:
-                        p = q.get("path", [""])[0]
+                if u.path == "/open":
+                    start = S.get("dir") or (os.path.expanduser("~") if FROZEN else os.getcwd())
+                    p = pick_file(start)
+                    if p is None: return self.send_json({"error": "nodialog"})
+                    if p == "": return self.send_json({"cancelled": True})
                     if not os.path.isfile(p):
                         return self.send_json({"error": f"File not found: {p}"})
                     with lock: load_image(p)
+                    return self.send_json(info())
+                if u.path == "/upload":                 # file dropped onto the page
+                    name = os.path.basename(q.get("name", ["image.tif"])[0])
+                    left = int(self.headers.get("Content-Length", 0))
+                    fd, tmp = tempfile.mkstemp(suffix=os.path.splitext(name)[1])
+                    try:
+                        with os.fdopen(fd, "wb") as f:
+                            while left > 0:
+                                chunk = self.rfile.read(min(left, 1 << 20))
+                                if not chunk: break
+                                f.write(chunk); left -= len(chunk)
+                        with lock: load_image(tmp, name)
+                    finally:
+                        os.remove(tmp)                  # fully loaded into memory, the copy isn't needed
                     return self.send_json(info())
                 if u.path == "/export":
                     if not S.get("path"): return self.send_json({"error": "no image loaded"})
