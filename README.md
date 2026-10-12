@@ -32,7 +32,7 @@ AstroBake isn't signed with a paid developer certificate, so your system will wa
 
 1. Click **Open stack…** and choose your stacked TIFF (16- or 32-bit), or drag it onto the page.
 2. Adjust rotation, crop and the tone sliders. Click the preview to choose where the 1:1 detail view looks.
-3. Click **Export full resolution**. AstroBake saves `<name>_processed.jpg`, plus a 16-bit TIFF for further editing, next to your original file. (For a dragged-in file, browsers don't reveal where it came from, so they go in your Downloads folder.)
+3. Click **Export full resolution**. AstroBake saves `<name>_processed.jpg` next to your original file. Tick **Also save 16-bit TIFF** first if you want a copy for further editing. (For a dragged-in file, browsers don't reveal where it came from, so they go in your Downloads folder.)
 
 When you're done, click **Quit** or just close the browser tab.
 

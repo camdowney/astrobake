@@ -16,8 +16,8 @@ Batch:    python astrobake.py stacked.tif --batch      # default settings straig
           (the UI shows the exact --batch command for whatever you've dialed in)
 Packages: numpy tifffile imagecodecs opencv-python-headless pillow (it offers to install them,
           in a private .venv if the system Python is locked or has no pip)
-Outputs:  <name>_processed_16bit.tif (for further editing in GIMP) and <name>_processed.jpg,
-          next to the input file.
+Outputs:  <name>_processed.jpg next to the input file, plus <name>_processed_16bit.tif
+          (for further editing in GIMP) with --tif or the UI's TIFF checkbox.
 Needs roughly 6x the image size in RAM (about 2 GB for a 24 MP stack).
 """
 import sys, importlib.util, os, shutil, subprocess
@@ -311,7 +311,7 @@ def apply_crop(a, crop):
 
 
 # ---------------------------------------------------------------- output helpers
-def save(a, out, tif=True):
+def save(a, out, tif=False):
     written = []
     if tif:
         tifffile.imwrite(out + "_16bit.tif", (a * 65535 + .5).astype(np.uint16), compression="zlib")
@@ -435,7 +435,7 @@ body.dropping main::after{content:"Drop to open";position:absolute;inset:12px;bo
     <h2>Tone &amp; color <button id="t_reset">Reset</button></h2>
     <div id="ctls"></div>
     <div class="export">
-      <label><input type="checkbox" id="tif" checked> Also save 16-bit TIFF</label>
+      <label><input type="checkbox" id="tif"> Also save 16-bit TIFF</label>
       <button class="primary" id="exp">Export full resolution</button>
       <div id="msg"></div>
       <code id="cmd"></code>
@@ -549,6 +549,7 @@ function updateCmd(){
   if (!loaded) return;
   let s = `python astrobake.py "${window.FILE}" --batch ` + CTL.map(c => `--${c.k} ${P[c.k]}`).join(" ");
   if (A) s += ` --rotate ${A}`;
+  if ($("tif").checked) s += " --tif";
   if (C.some((v,i) => Math.abs(v - [0,0,1,1][i]) > 1e-4)) s += ` --crop ${C.map(v => v.toFixed(4)).join(",")}`;
   $("cmd").textContent = s;
 }
@@ -648,6 +649,7 @@ $("r_p90").onclick = () => setAngle(A + 90);
 $("r_0").onclick = () => setAngle(0);
 $("c_reset").onclick = () => { C = inscribed(); drawCrop(); };
 $("t_reset").onclick = () => setTone(DEF);
+$("tif").onchange = updateCmd;
 $("exp").addEventListener("click", async () => {
   $("exp").disabled = true; $("msg").textContent = "Exporting full resolution… (takes a few seconds)";
   try{
@@ -998,7 +1000,7 @@ def main():
     p.add_argument("--port", type=int, default=8765, help="web UI port (default 8765)")
     p.add_argument("--no-browser", action="store_true", help="don't auto-open the browser")
     p.add_argument("-o", "--out", default=None, help="output name prefix")
-    p.add_argument("--no-tif", action="store_true", help="batch: only write a JPG")
+    p.add_argument("--tif", action="store_true", help="batch: also write a 16-bit TIFF")
     p.add_argument("--no-crop", action="store_true", help="skip the automatic dead-edge crop")
     d = DEFAULTS
     p.add_argument("--stretch", type=float, default=d["stretch"], help="arcsinh strength: higher = brighter faint stuff, compressed core")
@@ -1027,7 +1029,7 @@ def main():
     a, base_stats = prepare(args.input, not args.no_crop)
     print("settings:", settings, f"rotate={args.rotate}", f"crop={crop}")
     r = render_full(a, base_stats, settings, args.rotate, crop)
-    save(r, out, tif=not args.no_tif)
+    save(r, out, tif=args.tif)
 
 
 if __name__ == "__main__":
