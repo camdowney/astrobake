@@ -211,16 +211,18 @@ def mtf(x, m, target):
 
 
 # Default slider values ("natural"). Every look is reachable from the sliders in the UI.
-DEFAULTS = dict(stretch=900, target=0.13, sat=1.7, sky=0.075, denoise=1.3, scurve=0.12)
+DEFAULTS = dict(stretch=900, target=0.13, sat=1.7, sky=0.075, denoise=1.3, scurve=0.12, sharpen=0.0, temp=0.0)
 PARAMS = tuple(DEFAULTS)
 
 
-def process(a, stretch=900., target=0.13, sat=1.7, sky=0.075, denoise=1.3, scurve=0.12, stats=None):
+def process(a, stretch=900., target=0.13, sat=1.7, sky=0.075, denoise=1.3, scurve=0.12, sharpen=0., temp=0.,
+            stats=None, px=1.0):
     """Non-linear processing, in place where possible.
 
     `stats` holds image-wide numbers (noise level, black point, medians...). Any that are
     present are used as-is, missing ones are measured from `a` and written back. That lets
     a small preview or a 1:1 crop be processed exactly like the full image would be.
+    `px` is the size of one pixel in full-resolution pixels, so blur radii match on a downscaled preview.
     """
     st = stats if stats is not None else {}
     if "noise" not in st: st["noise"] = float(1.4826 * np.median(abs(a[::4, ::4, 1])))
@@ -249,8 +251,13 @@ def process(a, stretch=900., target=0.13, sat=1.7, sky=0.075, denoise=1.3, scurv
     L = a.mean(2, keepdims=True); a -= L; a *= sat; a += L; del L         # saturation
     np.clip(a, 0, 1, out=a)
 
+    if sharpen > 0.01:   # unsharp mask on the brighter structure only, so background noise isn't amplified
+        bl = cv2.GaussianBlur(a, (0, 0), 2.0 / px)
+        w = np.clip((a.mean(2) - target - 0.1) / 0.2, 0, 1)[..., None]   # the sky sits near `target` here
+        a += sharpen * w * (a - bl); np.clip(a, 0, 1, out=a); del bl, w; gc.collect()
+
     if denoise > 0.05:   # blur only faint areas so galaxy/stars stay sharp
-        bl = cv2.GaussianBlur(a, (0, 0), denoise)
+        bl = cv2.GaussianBlur(a, (0, 0), denoise / px)
         w = np.clip((a.mean(2) - 0.18) / 0.15, 0, 1)[..., None]
         a = bl * (1 - w) + a * w; del bl, w; gc.collect()
 
@@ -258,6 +265,9 @@ def process(a, stretch=900., target=0.13, sat=1.7, sky=0.075, denoise=1.3, scurv
     for c in range(3):                           # final neutral sky at level `sky`
         m = st["skymed"][c]
         a[..., c] = np.clip((a[..., c] - m) * (1 - sky) / (1 - m) + sky, 0, 1)
+    if abs(temp) > 0.001:                        # warm/cool the object, pivoting on the sky so it stays neutral
+        for c, g in ((0, 1 + 0.15 * temp), (2, 1 - 0.15 * temp)):
+            a[..., c] = np.clip((a[..., c] - sky) * g + sky, 0, 1)
     return a
 
 
@@ -344,7 +354,7 @@ UI_HTML = r"""<!doctype html>
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-:root{--bg:#111111;--panel:#1a1a1a;--line:#2e2e2e;--text:#ececec;--dim:#9a9a9a;--acc:#d9b25f;--warn:#ff7a59;}
+:root{--bg:#111111;--panel:#1a1a1a;--line:#2e2e2e;--text:#ececec;--dim:#9a9a9a;--acc:#e4e4e4;--warn:#ff7a59;}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 Roboto,system-ui,-apple-system,Segoe UI,sans-serif;
      display:grid;grid-template-columns:310px 1fr;height:100vh;overflow:hidden}
@@ -386,8 +396,8 @@ main{display:grid;grid-template-rows:58% 42%;min-height:0;position:relative}
 #cropbox{position:absolute;border:1.5px solid var(--acc);box-shadow:0 0 0 9999px rgba(0,0,0,.62);pointer-events:none}
 #cropbox .g{position:absolute;inset:0;display:none}
 #cropbox .g::before,#cropbox .g::after{content:"";position:absolute}
-#cropbox .thirds::before{inset:33.33% 0;border-top:1px solid #d9b25f55;border-bottom:1px solid #d9b25f55}
-#cropbox .thirds::after{inset:0 33.33%;border-left:1px solid #d9b25f55;border-right:1px solid #d9b25f55}
+#cropbox .thirds::before{inset:33.33% 0;border-top:1px solid #ffffff40;border-bottom:1px solid #ffffff40}
+#cropbox .thirds::after{inset:0 33.33%;border-left:1px solid #ffffff40;border-right:1px solid #ffffff40}
 #cropbox .center::before{left:0;right:0;top:50%;border-top:1px dashed #ffffff80}
 #cropbox .center::after{top:0;bottom:0;left:50%;border-left:1px dashed #ffffff80}
 #cropbox[data-g=thirds] .thirds,#cropbox[data-g=both] .thirds,
@@ -397,7 +407,9 @@ main{display:grid;grid-template-rows:58% 42%;min-height:0;position:relative}
 .seg button+button{border-left:1px solid var(--line)}
 .seg button.on{background:var(--acc);color:#111111;font-weight:600}
 .guiderow{display:flex;justify-content:space-between;align-items:center;font-size:13px;margin-top:10px}
-#marker{position:absolute;border:1px dashed #ffffffb0;pointer-events:none;display:none}
+#marker{position:absolute;border:1px dashed #ffffffc0;background:#ffffff0d;pointer-events:none;display:none}
+.pane.pan{cursor:grab;touch-action:none;user-select:none}.pane.pan.grabbing{cursor:grabbing}
+#det{will-change:transform}
 .bottom{display:grid;grid-template-columns:1fr 1fr;border-top:1px solid var(--line);min-height:0}
 .pane{position:relative;display:flex;align-items:center;justify-content:center;min-height:0;min-width:0;padding:10px;overflow:hidden}
 .pane+.pane{border-left:1px solid var(--line)}
@@ -406,7 +418,7 @@ main{display:grid;grid-template-rows:58% 42%;min-height:0;position:relative}
 #res{display:block}
 #stage #orig{position:absolute;inset:0;width:100%;height:100%;max-width:none;max-height:none;z-index:3;display:none}
 #sweep{position:absolute;top:0;bottom:0;left:0;width:2px;margin-left:-1px;background:#ffffff;
-       box-shadow:0 0 16px 5px #d9b25fb0;z-index:4;display:none}
+       box-shadow:0 0 16px 5px #ffffff90;z-index:4;display:none}
 #steps{position:absolute;bottom:20px;left:50%;transform:translateX(-50%);background:#111111d9;border:1px solid var(--line);
        font-size:13px;padding:7px 14px;border-radius:999px;z-index:6;display:none;white-space:nowrap}
 #steps::before{content:"";display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--acc);
@@ -419,7 +431,7 @@ body.intro .pane>:not(.tag){opacity:0}
 #busy{position:absolute;top:8px;right:14px;font-size:12px;color:var(--text);background:#111111d9;border:1px solid var(--line);
       padding:4px 10px 4px 8px;border-radius:999px;z-index:6;display:flex;align-items:center;gap:7px;
       opacity:0;transition:opacity .15s;pointer-events:none}
-#busy::before{content:"";width:11px;height:11px;border-radius:50%;border:2px solid #d9b25f40;border-top-color:var(--acc);
+#busy::before{content:"";width:11px;height:11px;border-radius:50%;border:2px solid #ffffff30;border-top-color:var(--acc);
               animation:spin .7s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
 body.rendering #busy{opacity:1;transition-delay:.12s}
@@ -433,7 +445,7 @@ body.rendering main::before{opacity:1;transition-delay:.12s}
 #welcome p{margin:0;color:var(--dim);max-width:460px}
 #welcome.loading p,#welcome.loading .primary{display:none}
 #welcome.loading h2{font-size:16px;font-weight:500;display:flex;align-items:center;gap:10px}
-#welcome.loading h2::before{content:"";width:14px;height:14px;border-radius:50%;border:2px solid #d9b25f40;
+#welcome.loading h2::before{content:"";width:14px;height:14px;border-radius:50%;border:2px solid #ffffff30;
                             border-top-color:var(--acc);animation:spin .7s linear infinite}
 body.dropping main::after{content:"Drop to open";position:absolute;inset:12px;border:2px dashed var(--acc);border-radius:10px;
      background:#111111e6;color:var(--acc);font-size:18px;display:flex;align-items:center;justify-content:center;z-index:10}
@@ -477,26 +489,24 @@ body.dropping main::after{content:"Drop to open";position:absolute;inset:12px;bo
       a few seconds while it crops the dead stacking edges, removes the gradient and balances color.</p>
     <button class="primary" id="open1">Open stack…</button>
   </div>
-  <div class="view"><span class="tag">Preview: drag the crop box · click to pick the 1:1 detail spot</span><span id="busy">Rendering…</span>
+  <div class="view"><span class="tag">Preview: adjust crop · drag the dashed box to move the 1:1 detail</span><span id="busy">Rendering…</span>
     <div id="stage"><img id="prev" alt="" draggable="false"><img id="orig" alt="" draggable="false"><div id="sweep"></div>
       <div id="cropbox" data-g="thirds"><div class="g thirds"></div><div class="g center"></div></div><div id="marker"></div></div><div id="steps"></div></div>
   <div class="bottom">
     <div class="pane"><span class="tag">Result</span><canvas id="res"></canvas></div>
-    <div class="pane"><span class="tag">1:1 detail (actual pixels)</span><img id="det" alt=""></div>
+    <div class="pane pan" id="detpane"><span class="tag">1:1 detail (actual pixels) · drag to pan</span><img id="det" alt="" draggable="false"></div>
   </div>
 </main>
 <script>
 const CTL = [
- {k:"stretch", name:"Stretch strength", min:50, max:10000, log:true,
-  help:"Higher brings out faint arms and compresses the bright core."},
- {k:"target", name:"Brightness", min:0.05, max:0.35, step:0.005,
-  help:"Overall midtone brightness after the stretch."},
- {k:"sky", name:"Sky background level", min:0, max:0.2, step:0.005,
-  help:"How gray the empty sky ends up. ~0.06-0.08 looks natural."},
- {k:"scurve", name:"Contrast (S-curve)", min:0, max:0.35, step:0.01, help:""},
- {k:"sat", name:"Saturation", min:0.5, max:3, step:0.05, help:""},
- {k:"denoise", name:"Background noise reduction", min:0, max:4, step:0.1,
-  help:"Smooths faint areas only; galaxy and stars stay sharp."},
+ {k:"stretch", name:"Stretch strength", min:50, max:10000, log:true},
+ {k:"target", name:"Brightness", min:0.05, max:0.35, step:0.005},
+ {k:"sky", name:"Sky background level", min:0, max:0.2, step:0.005},
+ {k:"scurve", name:"Contrast (S-curve)", min:0, max:0.35, step:0.01},
+ {k:"sharpen", name:"Sharpening", min:0, max:2, step:0.05},
+ {k:"sat", name:"Saturation", min:0.5, max:3, step:0.05},
+ {k:"temp", name:"Color temperature", min:-1, max:1, step:0.05},
+ {k:"denoise", name:"Background noise reduction", min:0, max:4, step:0.1},
 ];
 let P = {}, DEF = {}, A = 0, C = [0,0,1,1], W = 0, H = 0, W2 = 0, H2 = 0, DW = 1100, DH = 700;
 let cx = 0.5, cy = 0.5, busy = false, dirty = false, built = false, loaded = false, drag = null;
@@ -543,12 +553,21 @@ function drawCrop(){
   b.style.borderColor = ok ? "" : "#ff7a59";
   updateCmd(); drawResult();
 }
-function drawMarker(){
-  const m = $("marker"); if (!$("prev").naturalWidth) return;
+function markerRect(){             // the 1:1 detail window, in preview fractions
   const w = Math.min(1, DW/W2), h = Math.min(1, DH/H2);
   const x = clamp(cx - w/2, 0, 1-w), y = clamp(cy - h/2, 0, 1-h);
+  return [x, y, x+w, y+h];
+}
+function setSpot(x, y){            // keep the centre where the window actually sits, so drags don't build up slack
+  const w = Math.min(1, DW/W2), h = Math.min(1, DH/H2);
+  cx = clamp(x, w/2, 1-w/2); cy = clamp(y, h/2, 1-h/2);
+  drawMarker(); shiftDetail(); requestDetail();
+}
+function drawMarker(){
+  const m = $("marker"); if (!$("prev").naturalWidth) return;
+  const [x0,y0,x1,y1] = markerRect();
   m.style.display = "block";
-  m.style.left = x*100+"%"; m.style.top = y*100+"%"; m.style.width = w*100+"%"; m.style.height = h*100+"%";
+  m.style.left = x0*100+"%"; m.style.top = y0*100+"%"; m.style.width = (x1-x0)*100+"%"; m.style.height = (y1-y0)*100+"%";
 }
 function setAngle(v, keepCrop){
   v = ((+v + 180) % 360 + 360) % 360 - 180;            // wrap to [-180, 180)
@@ -589,10 +608,10 @@ async function request(){
   if (busy){ dirty = true; return; }
   busy = true; dirty = false; rendering(1);
   try{
-    const q = qs();
+    const q = qs(), at = [cx, cy];
     const [a,b] = await Promise.all([fetch("/preview?"+q), fetch("/detail?"+q)]);
     if (a.ok){ const u = URL.createObjectURL(await a.blob()); intro && !intro.revealing ? reveal(u) : ($("prev").src = u); }
-    if (b.ok) $("det").src = URL.createObjectURL(await b.blob());
+    if (b.ok) await showDetail(b, at);
   } catch(e){ $("msg").textContent = "Error: " + e; }
   busy = false; rendering(-1);
   if (dirty) request();
@@ -602,12 +621,30 @@ function rendering(d){
   pending += d;
   document.body.classList.toggle("rendering", pending > 0 && !intro);
 }
+let detAt = null, detBusy = false, detDirty = false;
+async function showDetail(resp, at){
+  const d = $("det"); d.src = URL.createObjectURL(await resp.blob());
+  await d.decode().catch(() => {});
+  detAt = at; shiftDetail();
+}
+function shiftDetail(){            // slide the last render by how far the spot has moved since, until the new one arrives
+  const d = $("det");
+  if (!detAt || !d.naturalWidth){ d.style.transform = ""; return; }
+  const w = Math.min(1, DW/W2), h = Math.min(1, DH/H2), k = d.clientWidth / d.naturalWidth;
+  const ex = v => clamp(v, w/2, 1-w/2), ey = v => clamp(v, h/2, 1-h/2);
+  const dx = (ex(detAt[0]) - ex(cx))*W2*k, dy = (ey(detAt[1]) - ey(cy))*H2*k;
+  d.style.transform = dx || dy ? `translate(${dx}px,${dy}px)` : "";
+}
 async function requestDetail(){
-  rendering(1);
+  if (!loaded) return;
+  if (detBusy){ detDirty = true; return; }
+  detBusy = true; detDirty = false; rendering(1);
   try{
-    const b = await fetch("/detail?"+qs());
-    if (b.ok){ $("det").src = URL.createObjectURL(await b.blob()); await $("det").decode().catch(() => {}); }
-  } finally { rendering(-1); }
+    const at = [cx, cy], b = await fetch("/detail?"+qs());
+    if (b.ok) await showDetail(b, at);
+  } catch(e){}
+  detBusy = false; rendering(-1);
+  if (detDirty) requestDetail();
 }
 $("prev").addEventListener("load", () => { drawMarker(); drawResult(); });
 
@@ -637,7 +674,7 @@ addEventListener("resize", () => {
 /* ---------- crop box interaction ---------- */
 const stage = $("stage"), MIN = 0.03;
 const CURSOR = {n:"ns-resize",s:"ns-resize",e:"ew-resize",w:"ew-resize",ne:"nesw-resize",sw:"nesw-resize",
-                nw:"nwse-resize",se:"nwse-resize",move:"move","":"crosshair"};
+                nw:"nwse-resize",se:"nwse-resize",move:"move",spot:"grab","":"default"};
 function rel(e){ const r = stage.getBoundingClientRect();
   return {x:(e.clientX-r.left)/r.width, y:(e.clientY-r.top)/r.height, w:r.width, h:r.height}; }
 function hit(p){
@@ -646,12 +683,17 @@ function hit(p){
   let m = "";
   if (inX && Math.abs(p.y-y0) < ty) m += "n"; else if (inX && Math.abs(p.y-y1) < ty) m += "s";
   if (inY && Math.abs(p.x-x0) < tx) m += "w"; else if (inY && Math.abs(p.x-x1) < tx) m += "e";
-  if (!m && p.x > x0 && p.x < x1 && p.y > y0 && p.y < y1) m = "move";
+  if (!m){
+    const [mx0,my0,mx1,my1] = markerRect();
+    if ($("marker").style.display === "block" && p.x > mx0 && p.x < mx1 && p.y > my0 && p.y < my1) m = "spot";
+    else if (p.x > x0 && p.x < x1 && p.y > y0 && p.y < y1) m = "move";
+  }
   return m;
 }
 stage.addEventListener("pointerdown", e => {
   if (!loaded) return;
-  const p = rel(e); drag = {mode: hit(p), p0: p, C0: [...C], moved: false};
+  const p = rel(e); drag = {mode: hit(p), p0: p, C0: [...C], s0: [cx, cy], moved: false};
+  if (drag.mode === "spot") stage.style.cursor = "grabbing";
   stage.setPointerCapture(e.pointerId);
 });
 stage.addEventListener("pointermove", e => {
@@ -661,6 +703,7 @@ stage.addEventListener("pointermove", e => {
   if (!drag.moved && Math.hypot(dx*p.w, dy*p.h) < 4) return;
   drag.moved = true;
   let [x0,y0,x1,y1] = drag.C0; const m = drag.mode;
+  if (m === "spot") return setSpot(drag.s0[0] + dx, drag.s0[1] + dy);
   if (m === "move"){
     const w = x1-x0, h = y1-y0;
     x0 = clamp(x0+dx, 0, 1-w); y0 = clamp(y0+dy, 0, 1-h); x1 = x0+w; y1 = y0+h;
@@ -673,9 +716,23 @@ stage.addEventListener("pointermove", e => {
   C = [x0,y0,x1,y1]; drawCrop();
 });
 stage.addEventListener("pointerup", e => {
-  if (drag && !drag.moved){ const p = rel(e); cx = clamp(p.x,0,1); cy = clamp(p.y,0,1); drawMarker(); requestDetail(); }
+  if (drag?.mode === "spot") stage.style.cursor = CURSOR.spot;
   drag = null;
 });
+
+/* ---------- pan the 1:1 detail by dragging it directly ---------- */
+const detpane = $("detpane"); let pan = null;
+detpane.addEventListener("pointerdown", e => {
+  if (!loaded || !$("det").naturalWidth) return;
+  pan = {x: e.clientX, y: e.clientY, s0: [cx, cy], k: $("det").clientWidth / $("det").naturalWidth};
+  detpane.setPointerCapture(e.pointerId); detpane.classList.add("grabbing");
+});
+detpane.addEventListener("pointermove", e => {
+  if (!pan) return;
+  setSpot(pan.s0[0] - (e.clientX - pan.x)/pan.k/W2, pan.s0[1] - (e.clientY - pan.y)/pan.k/H2);
+});
+const endPan = () => { pan = null; detpane.classList.remove("grabbing"); };
+detpane.addEventListener("pointerup", endPan); detpane.addEventListener("pointercancel", endPan);
 
 /* ---------- buttons ---------- */
 $("s_angle").addEventListener("input", e => setAngle(e.target.value));
@@ -893,8 +950,7 @@ def run_ui(path=None, crop=True, port=8765, open_browser=True, out=None, auto_qu
 
     def render_preview(s):
         st = dict(S["base"])
-        sp = dict(s); sp["denoise"] = s["denoise"] / S["k"]      # blur scales with preview size
-        return process(S["prev"].copy(), stats=st, **sp), st
+        return process(S["prev"].copy(), stats=st, px=S["k"], **s), st   # blur radii scale with preview size
 
     def render_detail(s, angle, cx, cy, dw=DW, dh=DH):
         """dw x dh window of the rotated full-res image at 1:1, centred on (cx, cy) of the rotated canvas."""
@@ -905,8 +961,8 @@ def run_ui(path=None, crop=True, port=8765, open_browser=True, out=None, auto_qu
         Minv = cv2.invertAffineTransform(M)
         pts = np.array([[x0, y0, 1], [x0 + dw, y0, 1], [x0, y0 + dh, 1], [x0 + dw, y0 + dh, 1]], float)
         src = pts @ Minv.T
-        sx0, sy0 = (max(0, int(math.floor(v)) - 4) for v in src.min(0))
-        sx1, sy1 = min(W, int(math.ceil(src[:, 0].max())) + 4), min(H, int(math.ceil(src[:, 1].max())) + 4)
+        sx0, sy0 = (max(0, int(math.floor(v)) - 12) for v in src.min(0))
+        sx1, sy1 = min(W, int(math.ceil(src[:, 0].max())) + 12), min(H, int(math.ceil(src[:, 1].max())) + 12)
         _, st = render_preview(s)                               # image-wide stats
         if sx1 <= sx0 or sy1 <= sy0:
             return np.zeros((dh, dw, 3), np.float32)
@@ -1060,6 +1116,8 @@ def main():
     p.add_argument("--scurve", type=float, default=d["scurve"], help="S-curve contrast strength (0-0.35)")
     p.add_argument("--sat", type=float, default=d["sat"], help="saturation multiplier")
     p.add_argument("--denoise", type=float, default=d["denoise"], help="background blur sigma, 0 = off")
+    p.add_argument("--sharpen", type=float, default=d["sharpen"], help="sharpening of bright structure (0-2), 0 = off")
+    p.add_argument("--temp", type=float, default=d["temp"], help="color temperature, -1 = cooler .. 1 = warmer")
     p.add_argument("--rotate", type=float, default=0.0, help="rotation in degrees, positive = clockwise")
     p.add_argument("--crop", default=None, help="x0,y0,x1,y1 as fractions of the rotated image "
                    "(default: largest crop with no empty corners)")
