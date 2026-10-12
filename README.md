@@ -1,12 +1,12 @@
-# AstroBake
+# Astrobake
 
-Automatic processing for deep-sky stacks. Open the linear TIFF straight out of DeepSkyStacker or Siril and AstroBake crops the dead stacking edges, removes the background gradient, balances color and stretches it, with live sliders and a 1:1 preview to fine-tune the result.
+Automatic processing for deep-sky stacks. Open the linear TIFF straight out of DeepSkyStacker or Siril and Astrobake crops the dead stacking edges, removes the background gradient, balances color and stretches it, with live sliders and a 1:1 preview to fine-tune the result.
 
-| One photo | Stacked | After AstroBake |
+| One photo | Stacked | After Astrobake |
 |---|---|---|
-| ![A single photo of the Andromeda Galaxy: dark blue sky with a faint smudge in the middle](docs/single-photo.jpg) | ![The stack before processing: almost entirely black, the galaxy barely visible](docs/before.jpg) | ![The same stack after AstroBake: the Andromeda Galaxy with its dust lanes and companion galaxies](docs/after.jpg) |
+| ![A single photo of the Andromeda Galaxy: dark blue sky with a faint smudge in the middle](docs/single-photo.jpg) | ![The stack before processing: almost entirely black, the galaxy barely visible](docs/before.jpg) | ![The same stack after Astrobake: the Andromeda Galaxy with its dust lanes and companion galaxies](docs/after.jpg) |
 
-<sub>The Andromeda Galaxy (M31) through a refractor. Left: one of the original photos, as the camera shows it. Middle: the stack straight out of DeepSkyStacker, as it looks in any image viewer. Right: the stack after AstroBake.</sub>
+<sub>The Andromeda Galaxy (M31) through a refractor. Left: one of the original photos, as the camera shows it. Middle: the stack straight out of DeepSkyStacker, as it looks in any image viewer. Right: the stack after Astrobake.</sub>
 
 ## Download
 
@@ -14,27 +14,27 @@ Grab the file for your computer from the [latest release](../../releases/latest)
 
 | System | File | To start |
 |---|---|---|
-| Windows | `AstroBake-Windows.exe` | Double-click it. |
-| macOS (Apple Silicon) | `AstroBake-macOS.zip` | Unzip, move `AstroBake.app` to Applications, double-click it. |
-| Linux | `AstroBake-Linux.tar.gz` | Extract, double-click `AstroBake`. |
+| Windows | `Astrobake-Windows.exe` | Double-click it. |
+| macOS (Apple Silicon) | `Astrobake-macOS.zip` | Unzip, move `Astrobake.app` to Applications, double-click it. |
+| Linux | `Astrobake-Linux.tar.gz` | Extract, double-click `Astrobake`. |
 
-AstroBake opens in your web browser. It takes a few seconds to start the first time.
+Astrobake opens in your web browser. It takes a few seconds to start the first time.
 
 ### The first time you open it
 
-AstroBake isn't signed with a paid developer certificate, so your system will warn you once:
+Astrobake isn't signed with a paid developer certificate, so your system will warn you once:
 
 - **Windows:** "Windows protected your PC". Click **More info**, then **Run anyway**.
-- **macOS:** "AstroBake can't be opened" or "Apple could not verify…". Click **Done**, open **System Settings → Privacy & Security**, scroll down and click **Open Anyway** next to AstroBake. (On macOS 14 and older you can instead right-click the app and choose **Open**.)
-- **Linux:** if double-clicking does nothing, right-click `AstroBake` → **Properties** → allow it to run as a program.
+- **macOS:** "Astrobake can't be opened" or "Apple could not verify…". Click **Done**, open **System Settings → Privacy & Security**, scroll down and click **Open Anyway** next to Astrobake. (On macOS 14 and older you can instead right-click the app and choose **Open**.)
+- **Linux:** if double-clicking does nothing, right-click `Astrobake` → **Properties** → allow it to run as a program.
 
 ## Using it
 
-![The AstroBake window: rotate, crop and tone sliders on the left, the crop preview in the middle, and the clean result and a 1:1 detail view on the right](docs/interface.jpg)
+![The Astrobake window: rotate, crop and tone sliders on the left, the crop preview in the middle, and the clean result and a 1:1 detail view on the right](docs/interface.jpg)
 
 1. Click **Open stack…** and choose your stacked TIFF (16- or 32-bit), or drag it onto the page.
-2. Adjust rotation, crop and the tone sliders. Every slider starts at 0, AstroBake's automatic setting. To check fine detail, drag the dashed box on the preview, or drag the 1:1 detail view itself.
-3. Click **Export full resolution**. AstroBake saves `<name>_processed.jpg` next to your original file. Tick **Also save 16-bit TIFF** first if you want a copy for further editing. (For a dragged-in file, browsers don't reveal where it came from, so they go in your Downloads folder.)
+2. Adjust rotation, crop and the tone sliders. Every slider starts at 0, Astrobake's automatic setting. To check fine detail, drag the dashed box on the preview, or drag the 1:1 detail view itself.
+3. Click **Export full resolution**. Astrobake saves `<name>_processed.jpg` next to your original file. Tick **Also save 16-bit TIFF** first if you want a copy for further editing. (For a dragged-in file, browsers don't reveal where it came from, so they go in your Downloads folder.)
 
 When you're done, click **Quit** or just close the browser tab.
 

@@ -18,11 +18,11 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            asset: AstroBake-Windows.exe
+            asset: Astrobake-Windows.exe
           - os: macos-latest          # Apple Silicon
-            asset: AstroBake-macOS.zip
+            asset: Astrobake-macOS.zip
           - os: ubuntu-22.04          # oldest supported glibc = runs on the most distros
-            asset: AstroBake-Linux.tar.gz
+            asset: Astrobake-Linux.tar.gz
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -41,19 +41,19 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $p = Start-Process dist/AstroBake.exe -ArgumentList "--help" -Wait -PassThru
+          $p = Start-Process dist/Astrobake.exe -ArgumentList "--help" -Wait -PassThru
           if ($p.ExitCode -ne 0) { exit 1 }
-          Copy-Item dist/AstroBake.exe ${{ matrix.asset }}
+          Copy-Item dist/Astrobake.exe ${{ matrix.asset }}
       - name: Smoke test and package (macOS)
         if: runner.os == 'macOS'
         run: |
-          dist/AstroBake.app/Contents/MacOS/AstroBake --help > /dev/null
-          ditto -c -k --keepParent dist/AstroBake.app ${{ matrix.asset }}
+          dist/Astrobake.app/Contents/MacOS/Astrobake --help > /dev/null
+          ditto -c -k --keepParent dist/Astrobake.app ${{ matrix.asset }}
       - name: Smoke test and package (Linux)
         if: runner.os == 'Linux'
         run: |
-          dist/AstroBake --help > /dev/null
-          tar -czf ${{ matrix.asset }} -C dist AstroBake
+          dist/Astrobake --help > /dev/null
+          tar -czf ${{ matrix.asset }} -C dist Astrobake
 
       - uses: actions/upload-artifact@v4
         with:
