@@ -666,8 +666,10 @@ def stack(lights, darks=None, flats=None, bias=None, out=None, kappa=2.5, best=1
     cal_paths = {k: subset(raw_files(d), cal_use.get(k, 1.0)) if d else []
                  for k, d in (("bias", bias), ("dark", darks), ("flat", flats))}
     n = len(paths)
-    # rough cost of each step in "reads of one raw file", for an honest progress bar
-    work = {"done": 0.0, "total": sum(len(v) for v in cal_paths.values()) + n * (1.0 + 2.2 + 2.2)}
+    # cost of each step per frame, relative to reading a calibration frame (measured), for an honest progress bar
+    MEASURE, PASS = 0.7, 1.5
+    expect = n if best >= 0.999 else min(n, max(2, round(n * best)))   # frames that will go through both passes
+    work = {"done": 0.0, "total": sum(len(v) for v in cal_paths.values()) + n * MEASURE + expect * 2 * PASS}
     t0 = time.monotonic()
 
     def tick(w=1.0, text=None, img=None):
@@ -708,7 +710,7 @@ def stack(lights, darks=None, flats=None, bias=None, out=None, kappa=2.5, best=1
             cv2.circle(img, (int(round(x)), int(round(y))), r, (0.45, 0.85, 0.55), 1, cv2.LINE_AA)
         return {"path": p, "stars": pts, "fwhm": fwhm * 2, "sky": cal.levels(cfa), "img": img}
     for i, f in enumerate(ordered_map(measure, paths, 3)):
-        info.append(f); tick(1, f"Finding stars ({i + 1}/{n})", f.pop("img"))
+        info.append(f); tick(MEASURE, f"Finding stars ({i + 1}/{n})", f.pop("img"))
     counts = np.array([len(f["stars"]) for f in info]); fw = np.array([f["fwhm"] for f in info])
     med_n = float(np.median(counts)); med_fw = float(np.median(fw[counts > 0])) if (counts > 0).any() else 0
     skipped = []
@@ -732,7 +734,7 @@ def stack(lights, darks=None, flats=None, bias=None, out=None, kappa=2.5, best=1
     use = [f for f in info if "skip" not in f and "drop" not in f]
     for name, why in skipped: print(f"skipping {name}: {why}")
     if len(use) < 2: raise ValueError("Fewer than 2 frames could be aligned")
-    work["total"] -= (n - len(use)) * 4.4
+    work["total"] -= (expect - len(use)) * 2 * PASS          # frames left out as unusable
     print(f"stacking {len(use)} of {n} frames, reference {os.path.basename(ref['path'])}, "
           f"FWHM {ref['fwhm']:.2f}px")
 
@@ -757,7 +759,7 @@ def stack(lights, darks=None, flats=None, bias=None, out=None, kappa=2.5, best=1
         img = None
         if i % 4 == 3 or i == len(use) - 1:
             img = quick_look(s[::pk, ::pk] / np.maximum(cnt[::pk, ::pk], 1)[..., None])
-        tick(2.2, f"Aligning and averaging ({i + 1}/{len(use)})", img)
+        tick(PASS, f"Aligning and averaging ({i + 1}/{len(use)})", img)
     nz = np.maximum(cnt, 1)[..., None]
     s /= nz; q /= nz; q -= s * s; np.maximum(q, 0, out=q); np.sqrt(q, out=q); q *= kappa   # s = mean, q = clip limit
     del nz; gc.collect()
@@ -775,7 +777,7 @@ def stack(lights, darks=None, flats=None, bias=None, out=None, kappa=2.5, best=1
         if i % 4 == 3 or i == len(use) - 1:
             a_, k_ = acc[::pk, ::pk], kept[::pk, ::pk]
             img = quick_look(np.where(k_ > 0, a_ / np.maximum(k_, 1), s[::pk, ::pk]))
-        tick(2.2, f"Rejecting satellites and noise ({i + 1}/{len(use)})", img)
+        tick(PASS, f"Rejecting satellites and noise ({i + 1}/{len(use)})", img)
     rejected = 1 - float(kept.sum()) / max(1, float(cnt.astype(np.int64).sum()) * 3)
     out_img = np.where(kept > 0, acc / np.maximum(kept, 1), s); del acc, kept, q, s; gc.collect()
 
@@ -1041,7 +1043,7 @@ body.rendering main::before{opacity:1;transition-delay:.12s}
 .mode span{font-size:12.5px;color:var(--dim);line-height:1.4}
 .folders{width:100%;display:flex;flex-direction:column;gap:8px;margin-top:4px}
 .frow{display:grid;grid-template-columns:52px 1fr auto auto 32px;gap:8px;align-items:stretch;text-align:left}
-.frow select{background:#242424;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:0 6px;font:inherit;
+.frow select{width:98px;background:#242424;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:0 6px;font:inherit;
              font-size:13px;cursor:pointer;visibility:hidden}
 .frow select:hover{border-color:var(--acc)}
 .frow.has select{visibility:visible}
@@ -1567,7 +1569,7 @@ $("restart").onclick = async () => {
 function unload(){
   loaded = false; P = {}; W = H = 0; detAt = null;
   $("ctlwrap").classList.add("off"); $("ctlwrap").inert = true;
-  $("file").textContent = "No image loaded"; $("file").title = "";
+  sideStatus("No image loaded");
   ["prev", "det", "orig"].forEach(id => $(id).removeAttribute("src"));
   $("res").width = 0; $("marker").style.display = "none";
   $("msg").textContent = $("cmd").textContent = ""; setTone(DEF); exportLabel();
@@ -1637,9 +1639,13 @@ $("s_go").onclick = async () => {
 };
 $("s_cancel").onclick = () => { $("s_cancel").disabled = true; $("s_step").textContent = "Stopping…"; fetch("/stackcancel", {method:"POST"}); };
 function eta(p){
-  if (p.frac < 0.04 || p.elapsed < 20) return "";
+  if (p.frac < 0.02 || p.elapsed < 10) return "";
   const s = p.elapsed * (1 - p.frac) / p.frac;
   return s < 60 ? "less than a minute left" : `about ${Math.round(s/60)} min left`;
+}
+function sideStatus(main, sub){    // the sidebar's file line, while there's no image to name there
+  $("file").textContent = main; $("file").title = "";
+  if (sub){ const s = document.createElement("small"); s.textContent = sub; $("file").append(s); }
 }
 function pollStack(){
   stacking = true; shownImg = 0; $("s_cancel").disabled = false;
@@ -1647,6 +1653,7 @@ function pollStack(){
   stackT = setInterval(async () => {
     let p; try{ p = await (await fetch("/stackprogress")).json(); } catch(e){ return; }
     if (p.state === "stacking"){
+      if (!loaded) sideStatus("Stacking…", p.text);
       $("s_bar").style.width = (p.frac*100).toFixed(1) + "%";
       if (!$("s_cancel").disabled) $("s_step").textContent = p.text;
       $("s_eta").textContent = eta(p);
@@ -1654,7 +1661,9 @@ function pollStack(){
     } else if (p.state === "loading"){
       if (!watcher){ stacking = false; showLoading("Opening your stack…"); watchLoad(); }
     } else {
-      clearInterval(stackT); stackT = null; stopWatch(); watcher = null; stacking = false; stackDone(p);
+      clearInterval(stackT); stackT = null; stopWatch(); watcher = null; stacking = false;
+      if (!loaded) sideStatus("No image loaded");
+      stackDone(p);
     }
   }, 500);
 }
