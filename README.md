@@ -6,7 +6,7 @@ Astrobake turns your raw deep-sky astrophotography images into finished pictures
 | ----------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
 | ![A single photo of the Andromeda Galaxy: dark blue sky with a faint smudge in the middle](docs/single-photo.jpg) | ![The Andromeda Galaxy after Astrobake: dust lanes and companion galaxies](docs/after.jpg) |
 
-<sub>The Andromeda Galaxy (M31) through a refractor. Left: one of the original light frames (photos), as the camera shows it. Right: after Astrobake stacking and processing with 100 light frames 80 calibration frames.</sub>
+<sub>The Andromeda Galaxy (M31) through a refractor. Left: one of the original light frames (photos), as the camera shows it. Right: after Astrobake stacking and processing of 100 light frames and 80 calibration frames.</sub>
 
 ## Download
 
