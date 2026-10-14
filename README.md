@@ -2,11 +2,11 @@
 
 Astrobake turns your raw deep-sky astrophotography images into finished pictures. Simply point it to your raw image folders and it automatically calibrates, aligns and stacks them. Then it crops the dead edges, removes background gradients, and balances and stretches the colors. Fine-tune the result with live sliders and a 1:1 preview.
 
-| Raw photo | After Astrobake (stacked and processed) |
-| --- | --- |
+| Raw photo                                                                                                         | After Astrobake (stacked and processed)                                                    |
+| ----------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
 | ![A single photo of the Andromeda Galaxy: dark blue sky with a faint smudge in the middle](docs/single-photo.jpg) | ![The Andromeda Galaxy after Astrobake: dust lanes and companion galaxies](docs/after.jpg) |
 
-<sub>The Andromeda Galaxy (M31) through a refractor. Left: one of the original photos, as the camera shows it. Right: after Astrobake.</sub>
+<sub>The Andromeda Galaxy (M31) through a refractor. Left: one of the original light frames (photos), as the camera shows it. Right: after Astrobake stacking and processing with 100 light frames 80 calibration frames.</sub>
 
 ## Download
 
