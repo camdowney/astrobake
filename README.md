@@ -1,22 +1,22 @@
 # Astrobake
 
-Turns a night of deep-sky photos into a finished picture. Point Astrobake at the folder of raw files from your camera and it calibrates, aligns and stacks them. Then it crops the dead edges, removes the background gradient, balances color and stretches the result, with live sliders and a 1:1 preview to fine-tune it. Already stacked in DeepSkyStacker or Siril? Open that TIFF and skip straight to processing.
+Astrobake turns your raw deep-sky astrophotography images into finished pictures. Simply point it to your raw image folders and it automatically calibrates, aligns and stacks them. Then it crops the dead edges, removes background gradients, and balances and stretches the colors. Fine-tune the result with live sliders and a 1:1 preview.
 
-| One photo | Stacked | After Astrobake |
-|---|---|---|
+| One photo                                                                                                         | Stacked                                                                                           | After Astrobake                                                                                                    |
+| ----------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
 | ![A single photo of the Andromeda Galaxy: dark blue sky with a faint smudge in the middle](docs/single-photo.jpg) | ![The stack before processing: almost entirely black, the galaxy barely visible](docs/before.jpg) | ![The same stack after Astrobake: the Andromeda Galaxy with its dust lanes and companion galaxies](docs/after.jpg) |
 
 <sub>The Andromeda Galaxy (M31) through a refractor. Left: one of the original photos, as the camera shows it. Middle: the photos stacked (here in DeepSkyStacker), as the result looks in any image viewer. It's nearly black because the data is still linear. Right: after Astrobake.</sub>
 
 ## Download
 
-Grab the file for your computer from the [latest release](../../releases/latest). Nothing else to install.
+Grab the file for your computer from the [latest release](../../releases/latest).
 
-| System | File | To start |
-|---|---|---|
-| Windows | `Astrobake-Windows.exe` | Double-click it. |
-| macOS (Apple Silicon) | `Astrobake-macOS.zip` | Unzip, move `Astrobake.app` to Applications, double-click it. |
-| Linux | `Astrobake-Linux.tar.gz` | Extract, double-click `Astrobake`. |
+| System                | File                     | To start                                                      |
+| --------------------- | ------------------------ | ------------------------------------------------------------- |
+| Windows               | `Astrobake-Windows.exe`  | Double-click it.                                              |
+| macOS (Apple Silicon) | `Astrobake-macOS.zip`    | Unzip, move `Astrobake.app` to Applications, double-click it. |
+| Linux                 | `Astrobake-Linux.tar.gz` | Extract, double-click `Astrobake`.                            |
 
 Astrobake opens in your web browser. It takes a few seconds to start the first time.
 

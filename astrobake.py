@@ -1628,13 +1628,20 @@ addEventListener("drop", async e => {
 });
 
 /* ---------- lifetime: tell the server we're here, and when we leave ---------- */
-function closed(){
-  showWelcome("Astrobake has closed", "Start it again to keep working. You can close this tab.");
+function closed(title = "Astrobake has closed", text = "Start it again to keep working. You can close this tab."){
+  showWelcome(title, text);
   gone = true; endIntro(); $("open1").style.display = $("w_back").style.display = "none";
   clearInterval(stackT); stacking = false;
   $("ctlwrap").classList.add("off"); $("ctlwrap").inert = true; $("quit").disabled = $("open2").disabled = true;
 }
-$("quit").onclick = async () => { try{ await fetch("/quit", {method:"POST"}); } catch(e){} closed(); };
+$("quit").onclick = async () => {
+  try{ await fetch("/quit", {method:"POST"}); } catch(e){}
+  closed("Astrobake is closing…", "This tab will close in a moment.");
+  setTimeout(() => {
+    window.close();       // browsers only allow this for tabs with no back history, like the one Astrobake opened
+    setTimeout(() => closed("Astrobake has closed", "Start it again to keep working. You can close this tab."), 300);
+  }, 1500);
+};
 setInterval(() => fetch("/ping").then(r => { if (!r.ok) throw 0; }).catch(closed), 20000);
 addEventListener("pagehide", () => navigator.sendBeacon("/bye"));
 (async () => { applyInfo(await (await fetch("/info")).json()); })();
