@@ -1,6 +1,6 @@
 # Astrobake
 
-Astrobake turns your raw deep-sky astrophotography images into finished pictures. Simply point it to your raw image folders and it automatically calibrates, aligns and stacks them. Then it crops the dead edges, removes background gradients, and balances and stretches the colors. Fine-tune the result with live sliders and a 1:1 preview.
+Astrobake turns your raw deep-sky astrophotography images into finished pictures. Simply point it to your raw image folders and it automatically calibrates, aligns and stacks them. Then it crops the dead edges, removes background gradients, and balances and stretches the colors. Fine-tune the result with live sliders and a 1:1 pixel preview.
 
 | Raw photo                                                                                                         | After Astrobake (stacked and processed)                                                    |
 | ----------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
@@ -49,7 +49,7 @@ Bayer-sensor cameras are supported, which covers nearly every DSLR and mirrorles
 2. Adjust rotation, crop and the tone sliders. Every slider starts at 0, Astrobake's automatic setting. To check fine detail, drag the dashed box on the preview, or drag the 1:1 detail view itself.
 3. Pick a **Size** and click **Export**. 50% often looks sharper than 100%, since most stacks hold less detail than their pixel count. Astrobake saves `<name>_processed_<width>x<height>.jpg` next to your original file. Exporting the same size again never overwrites it: the next one gets `_2`, and so on. Tick **Also save 16-bit TIFF** first if you want a copy for further editing. (For a dragged-in file, browsers don't reveal where it came from, so they go in your Downloads folder.)
 
-**Start over** in the sidebar stops a stack in progress or closes the image and takes you back to the first screen. When you're done, click **Quit** or just close the browser tab.
+**Start over** in the sidebar stops a stack in progress or closes the image and takes you back to the first screen. When you're done, just close the browser tab and Astrobake quits. If a stack is still running, it finishes and saves it first.
 
 Large stacks need roughly 6× their file size in memory (about 2 GB for a 24-megapixel image). Stacking needs about 3 GB, however many frames you have.
 

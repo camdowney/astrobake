@@ -947,7 +947,6 @@ body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 Roboto,syste
      display:grid;grid-template-columns:310px 1fr;height:100vh;overflow:hidden}
 aside{background:var(--panel);border-right:1px solid var(--line);padding:18px;overflow:auto}
 h1{font-size:16px;margin:0 0 8px;display:flex;justify-content:space-between;align-items:center}
-h1 button{font-size:11px;font-weight:400;padding:3px 8px}
 h2{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--dim);margin:20px 0 10px;
    display:flex;justify-content:space-between;align-items:center;font-weight:600}
 h2 button{font-size:11px;padding:3px 8px;letter-spacing:0;text-transform:none}
@@ -1077,7 +1076,7 @@ body.dropping main::after{content:"Drop to open";position:absolute;inset:12px;bo
 .ctlwrap.off{opacity:.4;pointer-events:none}
 </style></head><body>
 <aside>
-  <h1>Astrobake <button id="quit" title="Stop Astrobake">Quit</button></h1>
+  <h1>Astrobake</h1>
   <div class="filebar"><div class="file" id="file">No image loaded</div><button id="restart" title="Stop what's running, close the image and go back to the start">Start over</button></div>
   <div class="ctlwrap off" id="ctlwrap" inert>
     <h2>Rotate &amp; crop</h2>
@@ -1712,16 +1711,8 @@ function closed(title = "Astrobake has closed", text = "Start it again to keep w
   showWelcome(title, text);
   gone = true; endIntro(); $("open1").style.display = $("w_back").style.display = "none";
   clearInterval(stackT); stacking = false;
-  $("ctlwrap").classList.add("off"); $("ctlwrap").inert = true; $("quit").disabled = $("restart").disabled = true;
+  $("ctlwrap").classList.add("off"); $("ctlwrap").inert = true; $("restart").disabled = true;
 }
-$("quit").onclick = async () => {
-  try{ await fetch("/quit", {method:"POST"}); } catch(e){}
-  closed("Astrobake is closing…", "This tab will close in a moment.");
-  setTimeout(() => {
-    window.close();       // browsers only allow this for tabs with no back history, like the one Astrobake opened
-    setTimeout(() => closed("Astrobake has closed", "Start it again to keep working. You can close this tab."), 300);
-  }, 1500);
-};
 setInterval(() => fetch("/ping").then(r => { if (!r.ok) throw 0; }).catch(closed), 20000);
 addEventListener("pagehide", () => navigator.sendBeacon("/bye"));
 (async () => { applyInfo(await (await fetch("/info")).json()); })();
@@ -1732,9 +1723,42 @@ def downloads_dir():
     return d if os.path.isdir(d) else os.path.expanduser("~")
 
 
+def _linux_dialog(initial_dir, folder_title):
+    """The desktop's own dialog via zenity (GNOME and most others) or kdialog (KDE): Tk's Linux dialog
+    looks dated. Returns path, "" if cancelled, or None to fall back to Tk."""
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")): return None
+    start = os.path.join(initial_dir, "") if initial_dir else ""
+    env = os.environ.copy()
+    if FROZEN:   # PyInstaller points the library path at its bundle, which breaks system programs
+        orig = env.pop("LD_LIBRARY_PATH_ORIG", None)
+        if orig is None: env.pop("LD_LIBRARY_PATH", None)
+        else: env["LD_LIBRARY_PATH"] = orig
+    title = folder_title or "Open stacked image"
+    tries = []
+    if shutil.which("zenity"):
+        cmd = ["zenity", "--file-selection", f"--title={title}", f"--filename={start}"]
+        cmd += ["--directory"] if folder_title else ["--file-filter=TIFF images | *.tif *.tiff *.TIF *.TIFF",
+                                                     "--file-filter=All files | *"]
+        tries.append(cmd)
+    if shutil.which("kdialog"):
+        tries.append(["kdialog", "--title", title] + (["--getexistingdirectory", start or "."] if folder_title else
+                     ["--getopenfilename", start or ".", "*.tif *.tiff *.TIF *.TIFF|TIFF images"]))
+    for cmd in tries:
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=env)
+        except Exception:
+            continue
+        if r.returncode == 0: return r.stdout.strip()
+        if r.returncode == 1: return ""          # both use 1 for Cancel
+    return None
+
+
 def pick_file(initial_dir="", folder_title=None):
     """Native file dialog (or folder dialog, given a title), run in a subprocess so it works from the
     server thread on every OS. Returns path, "" if cancelled, or None if no GUI toolkit is available."""
+    if sys.platform.startswith("linux"):
+        p = _linux_dialog(initial_dir, folder_title)
+        if p is not None: return p
     me = [sys.executable] if FROZEN else [sys.executable, os.path.abspath(__file__)]
     fd, result = tempfile.mkstemp(suffix=".txt"); os.close(fd)
     extra = ["dir", folder_title] if folder_title else []
@@ -1749,9 +1773,9 @@ def pick_file(initial_dir="", folder_title=None):
         os.remove(result)
 
 
-def run_ui(path=None, crop=True, port=8765, open_browser=True, out=None, auto_quit=False):
-    """Serve the UI. With auto_quit (the packaged app has no console window to close) the server
-    stops shortly after the last browser tab closes, or when nothing has been heard for a while."""
+def run_ui(path=None, crop=True, port=8765, open_browser=True, out=None, auto_quit=True):
+    """Serve the UI. With auto_quit the server stops shortly after the last browser tab closes, or when
+    nothing has been heard for a while - but never in the middle of a stack, which finishes and saves first."""
     S = {"path": None}                     # current image state
     lock = threading.Lock()
     DW, DH = 1100, 700                     # 1:1 detail window size (pixels)
@@ -1924,9 +1948,6 @@ def run_ui(path=None, crop=True, port=8765, open_browser=True, out=None, auto_qu
                 if u.path == "/bye":                    # a tab closed (sent by the page on pagehide)
                     seen["bye"] = time.monotonic()
                     return self.send(b"ok", "text/plain")
-                if u.path == "/quit":
-                    self.send(b"ok", "text/plain")
-                    return threading.Thread(target=srv.shutdown).start()
                 if u.path == "/open":
                     start = S.get("dir") or (os.path.expanduser("~") if FROZEN else os.getcwd())
                     p = pick_file(start)
@@ -2016,7 +2037,7 @@ def run_ui(path=None, crop=True, port=8765, open_browser=True, out=None, auto_qu
         sys.exit(f"No free port between {port} and {port + 19}")
     url = f"http://127.0.0.1:{srv.server_address[1]}/"
     print(f"\nAstrobake running at {url}")
-    print("Leave this window open while you use it. Close it, press Ctrl+C or click Quit in the page to quit.")
+    print("Leave this window open while you use it. Closing the browser tab (or Ctrl+C here) quits.")
     if open_browser:
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()
 
@@ -2024,8 +2045,10 @@ def run_ui(path=None, crop=True, port=8765, open_browser=True, out=None, auto_qu
         while True:
             time.sleep(1)
             now = time.monotonic()
+            if stk["state"] in ("stacking", "loading"): continue    # let a stack finish and save
             # 5 s grace lets a reload reconnect; 10 min covers browsers that throttle background tabs
             if (seen["bye"] and now - seen["bye"] > 5) or now - seen["last"] > 600:
+                if stk["state"] == "done" and seen["bye"]: print("stack saved, quitting")
                 return srv.shutdown()
     if auto_quit:
         threading.Thread(target=watchdog, daemon=True).start()
@@ -2086,7 +2109,7 @@ def main():
         sys.exit(f"File not found: {args.input}")
 
     if not args.batch:
-        return run_ui(args.input, not args.no_crop, args.port, not args.no_browser, args.out, auto_quit=FROZEN)
+        return run_ui(args.input, not args.no_crop, args.port, not args.no_browser, args.out, )
 
     if not args.input:
         sys.exit("--batch needs an input file")
