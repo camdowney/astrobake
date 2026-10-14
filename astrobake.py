@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 """
-astrobake.py - automatic processing of a linear DSS/Siril stack,
+astrobake.py - stacking of raw deep-sky frames and automatic processing of the stack,
 with a local web UI (sliders + live preview) or straight from the command line.
 
-Steps: crop dead stacking edges -> remove background gradient -> neutralize sky
--> star-based white balance -> color-preserving arcsinh stretch -> black point
+Stacking: master bias/dark/flat -> calibrate each light (dark, flat, hot pixels) -> debayer
+-> align on star triangles -> kappa-sigma clipped average -> linear 32-bit stacked.tif.
+Processing (of that, or a DSS/Siril stack): crop dead stacking edges -> remove background
+gradient -> neutralize sky -> star-based white balance -> color-preserving arcsinh stretch -> black point
 + midtone stretch -> SCNR green removal -> S-curve -> saturation -> background
 noise reduction -> final sky neutralization -> rotate -> crop.
 
 App:      ready-to-run Windows/macOS/Linux downloads, no Python needed - see README.md
 Start:    python astrobake.py                          # UI, pick a file in the page
           python astrobake.py stacked.tif              # UI with that file loaded
+Stack:    python astrobake.py lights/ --stack-only     # raw frames -> stacked.tif (darks/flats/bias found)
 Batch:    python astrobake.py stacked.tif --batch      # default settings straight to files
           python astrobake.py stacked.tif --batch --stretch 4000 --rotate 12.5
           (the UI shows the exact --batch command for whatever you've dialed in)
-Packages: numpy tifffile imagecodecs opencv-python-headless pillow (it offers to install them,
+Packages: numpy tifffile imagecodecs opencv-python-headless pillow rawpy (it offers to install them,
           in a private .venv if the system Python is locked or has no pip)
 Outputs:  <name>_processed_<W>x<H>.jpg next to the input file, plus a matching _16bit.tif
           (for further editing in GIMP) with --tif or the UI's TIFF checkbox.
@@ -33,14 +36,17 @@ if sys.argv[1:2] == ["--pick-file"]:
     r = tk.Tk(); r.withdraw()
     try: r.attributes("-topmost", True)
     except Exception: pass
-    p = filedialog.askopenfilename(title="Open stacked image", initialdir=sys.argv[2] or None,
-                                   filetypes=[("TIFF images", "*.tif *.tiff"), ("All files", "*.*")])
+    if sys.argv[4:5] == ["dir"]:
+        p = filedialog.askdirectory(title=sys.argv[5], initialdir=sys.argv[2] or None, mustexist=True)
+    else:
+        p = filedialog.askopenfilename(title="Open stacked image", initialdir=sys.argv[2] or None,
+                                       filetypes=[("TIFF images", "*.tif *.tiff"), ("All files", "*.*")])
     with open(sys.argv[3], "w", encoding="utf-8") as f: f.write(p or "")
     sys.exit(0)
 
 # ---------------------------------------------------------------- dependency check
 REQUIRED = {"numpy": "numpy", "tifffile": "tifffile", "imagecodecs": "imagecodecs",
-            "cv2": "opencv-python-headless", "PIL": "pillow"}
+            "cv2": "opencv-python-headless", "PIL": "pillow", "rawpy": "rawpy"}
 _missing = [pkg for mod, pkg in REQUIRED.items() if importlib.util.find_spec(mod) is None]
 _here = os.path.dirname(os.path.abspath(__file__))
 _venv = os.path.join(_here, ".venv")
@@ -100,7 +106,7 @@ if _missing:
     print("\nInstalled. Starting…\n")
     sys.exit(subprocess.call([_venv_py, os.path.abspath(__file__), *sys.argv[1:]]))
 
-import argparse, base64, gc, io, json, math, tempfile, threading, time, webbrowser
+import argparse, base64, gc, io, json, math, re, tempfile, threading, time, webbrowser
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 import numpy as np, tifffile, cv2
@@ -130,9 +136,9 @@ def load(path):
     return a
 
 
-def autocrop(a, margin=20):
-    """Remove rows/cols at the borders that contain empty (zero) stacking pixels."""
-    z = a.sum(2) <= 0
+def _shave(z):
+    """Shrink a rectangle from the borders until no border row/column has any True in mask z.
+    Returns (top, bottom, left, right)."""
     H, W = z.shape
     t, b, l, r = 0, H, 0, W
     # repeatedly shave whichever border is "most empty" until no border has empty pixels
@@ -145,6 +151,13 @@ def autocrop(a, margin=20):
         elif side == "b": b -= 1
         elif side == "l": l += 1
         else: r -= 1
+    return t, b, l, r
+
+
+def autocrop(a, margin=20):
+    """Remove rows/cols at the borders that contain empty (zero) stacking pixels."""
+    H, W = a.shape[:2]
+    t, b, l, r = _shave(a.sum(2) <= 0)
     t, b, l, r = t + margin, b - margin, l + margin, r - margin
     print(f"crop: rows {t}:{b}, cols {l}:{r} (from {H}x{W})")
     return a[t:b, l:r].copy()
@@ -367,6 +380,387 @@ def render_full(full, base_stats, settings, angle=0.0, crop=None, scale=1.0):
         h, w = a.shape[:2]
         a = cv2.resize(a, (max(1, round(w * scale)), max(1, round(h * scale))), interpolation=cv2.INTER_AREA)
     return a
+
+
+# ---------------------------------------------------------------- stacking
+RAW_EXT = {".arw", ".cr2", ".cr3", ".crw", ".nef", ".nrw", ".raf", ".orf", ".rw2", ".pef", ".dng", ".srw",
+           ".raw", ".3fr", ".erf", ".kdc", ".mrw", ".rwl", ".srf", ".sr2", ".iiq"}
+CAL_KINDS = ("dark", "flat", "bias")
+
+
+class Cancelled(Exception):
+    pass
+
+
+def raw_files(d):
+    try:
+        return sorted(os.path.join(d, f) for f in os.listdir(d)
+                      if os.path.splitext(f)[1].lower() in RAW_EXT and not f.startswith("."))
+    except OSError:
+        return []
+
+
+def folder_kind(name):
+    """'dark', 'flat', 'bias' or 'lights' from a folder name like "Darks", "flat frames", "offset", "Lights"."""
+    m = re.match(r"(?:master[ _-]?)?(dark|flat|bias|offset|light)(?:e?s)?(?:[ _-].*|frames?)?$", name.lower())
+    return m and {"offset": "bias", "light": "lights"}.get(m[1], m[1])
+
+
+def find_folders(path):
+    """Work out the lights folder and its dark/flat/bias folders from whichever folder was picked:
+    the lights themselves (calibration folders sit beside or inside it) or the session folder holding them all."""
+    def subdirs(d):
+        try: return sorted(e.path for e in os.scandir(d) if e.is_dir() and not e.name.startswith("."))
+        except OSError: return []
+    lights = os.path.abspath(path)
+    if not raw_files(lights):
+        subs = [s for s in subdirs(lights) if raw_files(s)]
+        named = [s for s in subs if folder_kind(os.path.basename(s)) == "lights"]
+        unnamed = [s for s in subs if not folder_kind(os.path.basename(s))]
+        if named or len(unnamed) == 1: lights = (named or unnamed)[0]
+    found = {"lights": lights}
+    for d in subdirs(os.path.dirname(lights)) + subdirs(lights):
+        k = folder_kind(os.path.basename(d))
+        if k in CAL_KINDS and k not in found and d != lights and raw_files(d): found[k] = d
+    return found
+
+
+def read_raw(path):
+    """Undemosaiced sensor data of a camera raw file, cropped to the usable area.
+    Returns (uint16 mosaic, Bayer pattern like "RGGB", 2x2 black levels, white level, daylight WB as R,G,B)."""
+    import rawpy
+    with rawpy.imread(path) as r:
+        pat = r.raw_pattern
+        if pat is None or pat.shape != (2, 2):
+            raise ValueError(f"{os.path.basename(path)}: only Bayer-sensor cameras are supported "
+                             "(not Fujifilm X-Trans or monochrome sensors)")
+        a = r.raw_image_visible; s = r.sizes
+        y0, x0 = getattr(s, "crop_top_margin", 0) or 0, getattr(s, "crop_left_margin", 0) or 0
+        h = (getattr(s, "crop_height", 0) or a.shape[0] - y0) & ~1   # even, so the pattern tiles exactly
+        w = (getattr(s, "crop_width", 0) or a.shape[1] - x0) & ~1
+        a = a[y0:y0 + h, x0:x0 + w].copy()
+        desc = r.color_desc.decode()
+        idx = [[pat[(i + y0) % 2][(j + x0) % 2] for j in (0, 1)] for i in (0, 1)]
+        bayer = "".join(desc[idx[i][j]] for i in (0, 1) for j in (0, 1)).replace("g", "G")
+        black = np.array([[r.black_level_per_channel[idx[i][j]] for j in (0, 1)] for i in (0, 1)], np.float32)
+        wb = np.array(r.daylight_whitebalance[:3], np.float32)
+        return a, bayer, black, float(r.white_level), wb if wb.min() > 0 else np.ones(3, np.float32)
+
+
+def ordered_map(fn, items, workers=2):
+    """fn over items on a few threads (file decoding and OpenCV release the GIL), results in order,
+    never holding more than workers+1 finished frames in memory."""
+    from concurrent.futures import ThreadPoolExecutor
+    from collections import deque
+    with ThreadPoolExecutor(workers) as ex:
+        q = deque()
+        for x in items:
+            q.append(ex.submit(fn, x))
+            if len(q) > workers: yield q.popleft().result()
+        while q: yield q.popleft().result()
+
+
+def cfa_planes(a):
+    return [a[i::2, j::2] for i in (0, 1) for j in (0, 1)]
+
+
+def make_master(paths, tick):
+    """Median-combine raw calibration frames. Groups of frames are medianed separately and the group
+    medians averaged, so memory stays around 1 GB however many frames there are."""
+    first = read_raw(paths[0])[0]
+    per = max(3, min(len(paths), int(1.0e9 // first.nbytes)))
+    groups = [paths[i::math.ceil(len(paths) / per)] for i in range(math.ceil(len(paths) / per))]
+    acc = np.zeros(first.shape, np.float32)
+    for g in groups:
+        stack = np.empty((len(g),) + first.shape, np.uint16)
+        for k, a in enumerate(ordered_map(lambda p: read_raw(p)[0], g)):
+            if a.shape != first.shape:
+                raise ValueError(f"{os.path.basename(g[k])} is {a.shape[1]}x{a.shape[0]}, the others are "
+                                 f"{first.shape[1]}x{first.shape[0]} - are they all from the same camera?")
+            stack[k] = a; tick()
+        for y in range(0, first.shape[0], 256):          # banded: np.median copies its input
+            acc[y:y + 256] += np.median(stack[:, y:y + 256], axis=0) * (len(g) / len(paths))
+        del stack
+    return acc
+
+
+class Calibration:
+    """Master frames and the per-frame light calibration: subtract dark (or bias), divide by flat,
+    fix hot pixels, debayer, white balance. Everything ends up scaled so a saturated pixel is about 1."""
+
+    def __init__(self, sample, masters):
+        a, self.bayer, self.black, white, wb = read_raw(sample)
+        self.shape = a.shape
+        self.scale = 1.0 / (white - float(self.black.mean()))
+        self.wb = wb / wb.max()                          # never push a channel past saturation
+        self.code = getattr(cv2, f"COLOR_Bayer{self.bayer[3]}{self.bayer[2]}2RGB_EA")
+        blk = np.tile(self.black, (a.shape[0] // 2, a.shape[1] // 2))
+        bias, dark, flat = masters.get("bias"), masters.get("dark"), masters.get("flat")
+        for name, m in (("bias", bias), ("dark", dark), ("flat", flat)):
+            if m is not None and m.shape != a.shape:
+                raise ValueError(f"The {name} frames are a different size from the lights")
+        self.offset = dark if dark is not None else bias if bias is not None else blk
+        self.flat = None
+        if flat is not None:
+            f = flat - (bias if bias is not None else blk)
+            for p in cfa_planes(f):                       # per color, so the flat doesn't tint the image
+                p /= max(1e-6, float(np.median(p)))
+            self.flat = np.maximum(f, 0.05)
+        self.hot = None
+        if dark is not None:                              # pixels the dark frames show to be hot
+            d = dark - (bias if bias is not None else blk)
+            self.hot = np.zeros(d.shape, bool)
+            for p, h in zip(cfa_planes(d), cfa_planes(self.hot)):
+                med = float(np.median(p)); mad = 1.4826 * float(np.median(np.abs(p - med)))
+                h[:] = p > med + max(10 * mad, 30)
+            if self.hot.mean() > 0.01: self.hot = None   # implausibly many: leave it to the clipping
+
+    def mosaic(self, path):
+        a = read_raw(path)[0]
+        if a.shape != self.shape:
+            raise ValueError(f"{os.path.basename(path)} is {a.shape[1]}x{a.shape[0]}, "
+                             f"the first light is {self.shape[1]}x{self.shape[0]}")
+        a = a.astype(np.float32); a -= self.offset
+        if self.flat is not None: a /= self.flat
+        a *= self.scale
+        if self.hot is not None:
+            for p, h in zip(cfa_planes(a), cfa_planes(self.hot)):
+                p[h] = cv2.medianBlur(np.ascontiguousarray(p), 3)[h]
+        return a
+
+    def rgb(self, cfa):
+        # OpenCV's edge-aware demosaic needs integers: pedestal keeps faint negative noise, 50000 keeps precision
+        u = cv2.cvtColor(np.clip(cfa * 50000 + 2000, 0, 65535).astype(np.uint16), self.code)
+        a = u.astype(np.float32); del u
+        a -= 2000; a *= self.wb / 50000
+        return a
+
+    def levels(self, cfa):
+        """Per-channel sky level (R, G, B after white balance), from the mosaic."""
+        p = [float(np.median(q[::2, ::2])) for q in cfa_planes(cfa)]
+        g = [p[i] for i, ch in enumerate(self.bayer) if ch == "G"]
+        return np.array([p[self.bayer.index("R")], sum(g) / len(g), p[self.bayer.index("B")]], np.float32) * self.wb
+
+
+def find_stars(L, n=150):
+    """Brightest round stars in a 2D image: (x, y) array sorted brightest first, and median FWHM in pixels."""
+    h, w = L.shape
+    bg = cv2.resize(cv2.medianBlur(cv2.resize(L, (w // 16, h // 16), interpolation=cv2.INTER_AREA), 5),
+                    (w, h), interpolation=cv2.INTER_LINEAR)
+    d = L - bg; del bg
+    sm = cv2.GaussianBlur(d, (0, 0), 1.2)
+    s = sm[::3, ::3]; noise = 1.4826 * float(np.median(np.abs(s - np.median(s))))
+    peak = (sm == cv2.dilate(sm, np.ones((7, 7), np.uint8))) & (sm > 6 * noise)
+    peak[:8] = peak[-8:] = False; peak[:, :8] = peak[:, -8:] = False
+    ys, xs = np.nonzero(peak)
+    if len(xs) == 0: return np.zeros((0, 2)), 0.0
+    o = np.argsort(-sm[ys, xs])[:2000]; ys, xs = ys[o], xs[o]
+    r = np.arange(-5, 6)
+    win = np.clip(d[ys[:, None, None] + r[None, :, None], xs[:, None, None] + r[None, None, :]], 0, None)
+    flux = win.sum((1, 2)) + 1e-12
+    cx = (win * r[None, None, :]).sum((1, 2)) / flux; cy = (win * r[None, :, None]).sum((1, 2)) / flux
+    fwhm = 2 * np.sqrt((win >= 0.5 * win.max((1, 2), keepdims=True)).sum((1, 2)) / np.pi)   # from the half-max area
+    top = L[ys, xs] < 0.95 * float(L.max())                 # skip saturated cores, they centroid poorly
+    ok = (fwhm > 1.5) & (fwhm < 9) & top & (np.hypot(cx, cy) < 2)   # rejects hot pixels and smudges
+    o = np.argsort(-flux[ok])[:n]
+    pts = np.stack([xs[ok][o] + cx[ok][o], ys[ok][o] + cy[ok][o]], 1)
+    return pts, float(np.median(fwhm[ok][o])) if ok.any() else 0.0
+
+
+def _triangles(pts):
+    """Triangles from each star and pairs of its nearest neighbours, with their scale/rotation-invariant
+    shape (ratios of sorted sides) and vertices in a canonical order."""
+    from itertools import combinations
+    d = np.hypot(*(pts[:, None] - pts[None]).transpose(2, 0, 1))
+    tris = set()
+    for i in range(len(pts)):
+        for j, k in combinations(np.argsort(d[i])[1:6], 2):
+            tris.add(tuple(sorted((i, int(j), int(k)))))
+    tris = np.array(sorted(tris))
+    if len(tris) == 0: return np.zeros((0, 2)), tris
+    v = pts[tris]
+    side = np.stack([np.hypot(*(v[:, 1] - v[:, 2]).T), np.hypot(*(v[:, 2] - v[:, 0]).T),
+                     np.hypot(*(v[:, 0] - v[:, 1]).T)], 1)        # side i is opposite vertex i
+    o = np.argsort(-side, 1)
+    side = np.take_along_axis(side, o, 1)
+    keep = side[:, 2] > 1e-6
+    return (np.stack([side[:, 1] / side[:, 0], side[:, 2] / side[:, 1]], 1)[keep],
+            np.take_along_axis(tris, o, 1)[keep])
+
+
+def match_stars(src, dst):
+    """Similarity transform (2x3) taking star list src onto dst, or None. Triangle shapes give
+    candidate pairs, RANSAC keeps the consistent ones, then every star is matched for the final fit."""
+    if len(src) < 6 or len(dst) < 6: return None
+    for top in (40, 80, 150):                             # brightest stars first; more if they don't agree
+        fs, ts = _triangles(src[:top]); fd, td = _triangles(dst[:top])
+        if len(fs) and len(fd):
+            dist = np.hypot(*(fs[:, None] - fd[None]).transpose(2, 0, 1))
+            j = dist.argmin(1); good = dist[np.arange(len(fs)), j] < 0.008
+            if good.sum() >= 3:
+                a = src[ts[good].ravel()]; b = dst[td[j[good]].ravel()]
+                M, _ = cv2.estimateAffinePartial2D(a.astype(np.float32), b.astype(np.float32), method=cv2.RANSAC,
+                                                   ransacReprojThreshold=2.0, maxIters=5000)
+                M = M if M is None else _refine(M, src, dst)
+                if M is not None: return M
+        if top >= max(len(src), len(dst)): break
+    return None
+
+
+def _refine(M, src, dst):
+    """Refit M on every star it lines up, tightening the match radius; None unless enough stars agree
+    (a chance fit of a few triangles fails here)."""
+    for tol in (2.0, 1.0):
+        p = src @ M[:, :2].T + M[:, 2]
+        dd = np.hypot(*(p[:, None] - dst[None]).transpose(2, 0, 1))
+        k = dd.argmin(1); m = dd[np.arange(len(src)), k] < tol
+        if m.sum() < max(8, 0.2 * min(len(src), len(dst))): return None
+        M, _ = cv2.estimateAffinePartial2D(src[m].astype(np.float32), dst[k[m]].astype(np.float32),
+                                           method=cv2.LMEDS)
+        if M is None: return None
+    return M if 0.9 < math.hypot(M[0, 0], M[1, 0]) < 1.1 else None
+
+
+def quick_look(a):
+    """Auto-stretched view of a (small) linear image, for showing a stack as it builds up."""
+    s = np.array(a, np.float32)
+    for c in range(3):
+        x = s[..., c]; med = float(np.median(x)); mad = 1.4826 * float(np.median(np.abs(x - med))) + 1e-9
+        lo = med - 2.8 * mad; hi = max(float(np.percentile(x, 99.99)), lo + 1e-6)
+        x -= lo; x /= hi - lo; np.clip(x, 0, 1, out=x)
+        x[:] = mtf(x, max(1e-4, (med - lo) / (hi - lo)), 0.22)
+    return s
+
+
+def stack(lights, darks=None, flats=None, bias=None, out=None, kappa=2.5, progress=None, cancelled=None):
+    """Calibrate, align and combine a folder of raw light frames into a linear 32-bit TIFF, which is
+    returned (path, report). `progress(text, fraction, preview=None)` hears about each step;
+    `cancelled()` returning True stops at the next frame."""
+    say = progress or (lambda text, frac, img=None: None)
+    stop = cancelled or (lambda: False)
+    paths = raw_files(lights)
+    if len(paths) < 2: raise ValueError(f"Need at least 2 raw files to stack, found {len(paths)} in {lights}")
+    cal_paths = {k: raw_files(d) if d else [] for k, d in (("bias", bias), ("dark", darks), ("flat", flats))}
+    n = len(paths)
+    # rough cost of each step in "reads of one raw file", for an honest progress bar
+    work = {"done": 0.0, "total": sum(len(v) for v in cal_paths.values()) + n * (1.0 + 2.2 + 2.2)}
+    t0 = time.monotonic()
+
+    def tick(w=1.0, text=None, img=None):
+        if stop(): raise Cancelled()
+        work["done"] += w
+        if text: say(text, min(1.0, work["done"] / work["total"]), img)
+
+    masters = {}
+    for kind in ("bias", "dark", "flat"):
+        ps = cal_paths[kind]
+        if not ps: continue
+        label = kind
+        done = [0]
+        def t(label=label, total=len(ps)):
+            done[0] += 1; tick(1, f"Building master {label} ({done[0]}/{total})")
+        say(f"Building master {label} (0/{len(ps)})", work["done"] / work["total"])
+        masters[kind] = make_master(ps, t)
+        print(f"master {label}: {len(ps)} frames")
+    cal = Calibration(paths[0], masters); del masters
+    gc.collect()
+
+    # pass 1: measure every frame (stars, sharpness, sky level) on a half-size luminance image
+    info = []
+    def measure(p):
+        cfa = cal.mosaic(p)
+        h, w = cfa.shape
+        L = cfa.reshape(h // 2, 2, w // 2, 2).mean((1, 3))
+        pts, fwhm = find_stars(L)
+        return {"path": p, "stars": pts, "fwhm": fwhm * 2, "sky": cal.levels(cfa)}
+    for i, f in enumerate(ordered_map(measure, paths, 3)):
+        info.append(f); tick(1, f"Finding stars ({i + 1}/{n})")
+    counts = np.array([len(f["stars"]) for f in info]); fw = np.array([f["fwhm"] for f in info])
+    med_n = float(np.median(counts)); med_fw = float(np.median(fw[counts > 0])) if (counts > 0).any() else 0
+    skipped = []
+    for f in info:
+        if len(f["stars"]) < max(8, 0.4 * med_n): f["skip"] = "too few stars (clouds?)"
+        elif f["fwhm"] > 1.5 * med_fw: f["skip"] = "blurry or trailed stars"
+    usable = [f for f in info if "skip" not in f]
+    if not usable: raise ValueError("Couldn't find enough stars in any frame to align them")
+    ref = min(usable, key=lambda f: f["fwhm"] - 1e-3 * len(f["stars"]))    # sharpest frame
+    for f in usable:
+        M = np.float64([[1, 0, 0], [0, 1, 0]]) if f is ref else match_stars(f["stars"], ref["stars"])
+        if M is None: f["skip"] = "couldn't align it with the others"; continue
+        # half-size pixel X spans full-size pixels 2X, 2X+1, so its centre is at 2X + 0.5
+        A = M[:, :2]; f["M"] = np.hstack([A, (2 * M[:, 2] + 0.5 * (1 - A.sum(1)))[:, None]])
+    skipped = [(os.path.basename(f["path"]), f["skip"]) for f in info if "skip" in f]
+    use = [f for f in info if "skip" not in f]
+    for name, why in skipped: print(f"skipping {name}: {why}")
+    if len(use) < 2: raise ValueError("Fewer than 2 frames could be aligned")
+    work["total"] -= (n - len(use)) * 4.4
+    print(f"stacking {len(use)} of {n} frames, reference {os.path.basename(ref['path'])}, "
+          f"FWHM {ref['fwhm']:.2f}px")
+
+    H, W = cal.shape
+    pk = max(1, math.ceil(max(W, H) / 1600))              # preview stride
+    def aligned(f):
+        a = cal.rgb(cal.mosaic(f["path"]))
+        a += ref["sky"] - f["sky"]                         # match sky levels so clipping compares like with like
+        out = cv2.warpAffine(a, f["M"], (W, H), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+        del a
+        m = cv2.warpAffine(np.ones((H, W), np.uint8), f["M"], (W, H), flags=cv2.INTER_NEAREST, borderValue=0)
+        return out, cv2.erode(m, np.ones((5, 5), np.uint8))   # drop the border pixels interpolation smeared
+    B = 512                                               # row band: keeps temporaries small
+
+    # pass 2: per-pixel mean and spread over all frames
+    s = np.zeros((H, W, 3), np.float32); q = np.zeros((H, W, 3), np.float32); cnt = np.zeros((H, W), np.uint16)
+    for i, (a, m) in enumerate(ordered_map(aligned, use)):
+        for y in range(0, H, B):
+            d, mm = a[y:y + B], m[y:y + B]
+            dm = d * mm[..., None]; s[y:y + B] += dm; dm *= d; q[y:y + B] += dm; cnt[y:y + B] += mm
+        del a, m
+        img = None
+        if i % 4 == 3 or i == len(use) - 1:
+            img = quick_look(s[::pk, ::pk] / np.maximum(cnt[::pk, ::pk], 1)[..., None])
+        tick(2.2, f"Aligning and averaging ({i + 1}/{len(use)})", img)
+    nz = np.maximum(cnt, 1)[..., None]
+    s /= nz; q /= nz; q -= s * s; np.maximum(q, 0, out=q); np.sqrt(q, out=q); q *= kappa   # s = mean, q = clip limit
+    del nz; gc.collect()
+
+    # pass 3: average again, leaving out pixels far from the mean (satellites, planes, hot pixels, cosmic rays)
+    acc = np.zeros((H, W, 3), np.float32); kept = np.zeros((H, W, 3), np.uint16)
+    for i, (a, m) in enumerate(ordered_map(aligned, use)):
+        for y in range(0, H, B):
+            d = a[y:y + B]
+            ok = np.abs(d - s[y:y + B]) <= q[y:y + B] + 1e-7
+            ok &= m[y:y + B, :, None].astype(bool)
+            acc[y:y + B] += np.where(ok, d, 0); kept[y:y + B] += ok
+        del a, m
+        img = None
+        if i % 4 == 3 or i == len(use) - 1:
+            a_, k_ = acc[::pk, ::pk], kept[::pk, ::pk]
+            img = quick_look(np.where(k_ > 0, a_ / np.maximum(k_, 1), s[::pk, ::pk]))
+        tick(2.2, f"Rejecting satellites and noise ({i + 1}/{len(use)})", img)
+    rejected = 1 - float(kept.sum()) / max(1, float(cnt.astype(np.int64).sum()) * 3)
+    out_img = np.where(kept > 0, acc / np.maximum(kept, 1), s); del acc, kept, q, s; gc.collect()
+
+    # keep only the area most frames cover, so drift doesn't leave noisy or empty edges
+    t, b, l, r = _shave(cnt < 0.9 * len(use))
+    out_img = np.ascontiguousarray(out_img[t:b, l:r])
+    # the processing step reads zero as "no data", so lift a background that calibration left at or below zero
+    lo = np.percentile(out_img[::4, ::4].reshape(-1, 3), 0.01, axis=0)
+    out_img -= np.minimum(lo, 0)[None, None, :] - 1e-4
+    np.maximum(out_img, 1e-6, out=out_img)
+    say("Saving the stack…", 0.995)
+    dest = out or os.path.join(os.path.dirname(os.path.abspath(lights)), "stacked")
+    base, k = dest, 1
+    while os.path.exists(base + ".tif"):
+        k += 1; base = f"{dest}_{k}"
+    tifffile.imwrite(base + ".tif", out_img, photometric="rgb")
+    secs = time.monotonic() - t0
+    report = {"file": os.path.abspath(base + ".tif"), "used": len(use), "total": n, "skipped": skipped,
+              "W": int(out_img.shape[1]), "H": int(out_img.shape[0]), "seconds": round(secs),
+              "fwhm": round(ref["fwhm"], 2), "rejected": round(100 * rejected, 2),
+              "calibration": [k for k in CAL_KINDS if cal_paths[k]]}
+    print(f"wrote {base}.tif ({out_img.shape[1]}x{out_img.shape[0]}, {len(use)} frames, "
+          f"{report['rejected']}% pixels rejected) in {secs / 60:.1f} min")
+    return report
 
 
 # ---------------------------------------------------------------- web UI
@@ -598,7 +992,38 @@ body.rendering main::before{opacity:1;transition-delay:.12s}
          justify-content:center;gap:14px;text-align:center;padding:30px;z-index:5}
 #welcome h2{margin:0;font-size:20px;font-weight:600;color:var(--text);text-transform:none;letter-spacing:0}
 #welcome p{margin:0;color:var(--dim);max-width:460px}
-#welcome.loading p,#welcome.loading .primary{display:none}
+#welcome .scr{display:none;flex-direction:column;align-items:center;gap:14px;width:100%;max-width:660px}
+#welcome .scr.on{display:flex}
+#welcome #w_stack{max-width:900px}
+.wrow{display:flex;gap:10px;justify-content:center;margin-top:4px}
+.modes{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;width:100%;margin-top:6px}
+.mode{display:flex;flex-direction:column;gap:6px;text-align:left;padding:14px 16px;border-radius:10px;background:var(--panel)}
+.mode b{font-size:15px;font-weight:600}
+.mode span{font-size:12.5px;color:var(--dim);line-height:1.4}
+.folders{width:100%;display:flex;flex-direction:column;gap:8px;margin-top:4px}
+.frow{display:grid;grid-template-columns:52px 1fr auto 32px;gap:8px;align-items:stretch;text-align:left}
+.frow .fk{font-size:13px;align-self:center}
+.frow .fp{display:flex;align-items:center;gap:10px;min-width:0;font-size:12px;background:#111111;border:1px solid var(--line);
+          border-radius:6px;padding:0 10px;cursor:pointer}
+.frow .fp:hover{border-color:var(--acc)}
+.frow .pth{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-align:left}
+.frow .pth:not(:empty){direction:rtl}   /* long paths lose their start, not the folder name */
+.frow .pth:empty::before{content:attr(data-ph);color:var(--dim)}
+.frow .fn{color:var(--dim);white-space:nowrap;font-variant-numeric:tabular-nums}
+.frow .fn.bad{color:var(--warn)}
+.frow .clr{padding:0;visibility:hidden}
+.frow.has .clr{visibility:visible}
+#f_lights .clr{visibility:hidden}
+#s_err{color:var(--warn);font-size:12.5px;min-height:1em}
+.sprev{width:100%;height:min(58vh,600px);background:#000;border:1px solid var(--line);border-radius:8px;
+       display:flex;align-items:center;justify-content:center;overflow:hidden}
+.sprev img{max-width:100%;max-height:100%;display:block}
+.bar{width:100%;height:4px;background:var(--line);border-radius:2px;overflow:hidden}
+.bar i{display:block;height:100%;width:0;background:var(--acc);transition:width .4s}
+.srow{width:100%;display:flex;justify-content:space-between;gap:12px;font-size:13px;color:var(--dim)}
+#s_step{color:var(--text)}
+#welcome .left{text-align:left;max-width:none;width:100%;font-size:12.5px}
+#welcome.loading p,#welcome.loading .primary,#welcome.loading .wrow{display:none}
 #welcome.loading h2{font-size:16px;font-weight:500;display:flex;align-items:center;gap:10px}
 #welcome.loading h2::before{content:"";width:14px;height:14px;border-radius:50%;border:2px solid #ffffff30;
                             border-top-color:var(--acc);animation:spin .7s linear infinite}
@@ -608,7 +1033,7 @@ body.dropping main::after{content:"Drop to open";position:absolute;inset:12px;bo
 </style></head><body>
 <aside>
   <h1>Astrobake <button id="quit" title="Stop Astrobake">Quit</button></h1>
-  <div class="filebar"><div class="file" id="file">No image loaded</div><button id="open2">Open…</button></div>
+  <div class="filebar"><div class="file" id="file">No image loaded</div><button id="open2" title="Stack raw frames or open a stacked image">Open…</button></div>
   <div class="ctlwrap off" id="ctlwrap" inert>
     <h2>Rotate &amp; crop</h2>
     <div class="ctl">
@@ -640,9 +1065,44 @@ body.dropping main::after{content:"Drop to open";position:absolute;inset:12px;bo
 </aside>
 <main>
   <div id="welcome">
-    <h2 id="wtitle">Open a stacked image</h2>
-    <p id="wtext">Pick the TIFF straight out of DeepSkyStacker or Siril (16- or 32-bit),<br>or drag it onto this page.</p>
-    <button class="primary" id="open1">Open stack…</button>
+    <div class="scr" id="w_msg">
+      <h2 id="wtitle">Open a stacked image</h2>
+      <p id="wtext">Pick the TIFF straight out of DeepSkyStacker or Siril (16- or 32-bit),<br>or drag it onto this page.</p>
+      <div class="wrow"><button id="w_back">Back</button><button class="primary" id="open1">Open stack…</button></div>
+    </div>
+    <div class="scr" id="w_home">
+      <h2>What would you like to do?</h2>
+      <div class="modes">
+        <button class="mode" data-mode="both"><b>Stack &amp; process</b><span>Turn raw frames from your camera into a finished picture</span></button>
+        <button class="mode" data-mode="stack"><b>Stack only</b><span>Calibrate, align and combine raw frames into a stacked TIFF</span></button>
+        <button class="mode" data-mode="process"><b>Process a stack</b><span>Open a stacked TIFF from DeepSkyStacker, Siril, etc.</span></button>
+      </div>
+      <div class="wrow"><button id="h_back">Back to editing</button></div>
+    </div>
+    <div class="scr" id="w_setup">
+      <h2 id="s_title">Stack &amp; process</h2>
+      <div class="folders">
+        <div class="frow" id="f_lights"><span class="fk">Lights</span><div class="fp"><span class="pth" data-ph="Folder of raw light frames"></span><span class="fn"></span></div><button class="pick">Choose…</button><button class="clr">×</button></div>
+        <div class="frow" id="f_dark"><span class="fk">Darks</span><div class="fp"><span class="pth" data-ph="None (optional)"></span><span class="fn"></span></div><button class="pick">Choose…</button><button class="clr" title="Don't use darks">×</button></div>
+        <div class="frow" id="f_flat"><span class="fk">Flats</span><div class="fp"><span class="pth" data-ph="None (optional)"></span><span class="fn"></span></div><button class="pick">Choose…</button><button class="clr" title="Don't use flats">×</button></div>
+        <div class="frow" id="f_bias"><span class="fk">Bias</span><div class="fp"><span class="pth" data-ph="None (optional)"></span><span class="fn"></span></div><button class="pick">Choose…</button><button class="clr" title="Don't use bias frames">×</button></div>
+      </div>
+      <p class="note" id="s_note">Dark, flat and bias folders next to the lights are filled in automatically.</p>
+      <div id="s_err"></div>
+      <div class="wrow"><button id="s_back">Back</button><button class="primary" id="s_go" disabled>Start stacking</button></div>
+    </div>
+    <div class="scr" id="w_stack">
+      <div class="sprev"><img id="s_img" alt=""></div>
+      <div class="bar"><i id="s_bar"></i></div>
+      <div class="srow"><span id="s_step">Starting…</span><span id="s_eta"></span></div>
+      <button id="s_cancel">Cancel</button>
+    </div>
+    <div class="scr" id="w_done">
+      <h2>Stack saved</h2>
+      <p id="d_file"></p>
+      <p id="d_info" class="note"></p>
+      <div class="wrow"><button id="d_again">Stack another</button><button class="primary" id="d_process">Process it now</button></div>
+    </div>
   </div>
   <div class="view"><span class="tag">Preview: adjust crop · drag the dashed box to move the 1:1 detail</span><span id="busy">Rendering…</span>
     <div id="stage"><img id="prev" alt="" draggable="false"><img id="orig" alt="" draggable="false"><div id="sweep"></div>
@@ -952,9 +1412,19 @@ $("exp").addEventListener("click", async () => {
 
 /* ---------- opening files ---------- */
 const WTEXT = $("wtext").innerHTML;
+function screen(id){               // which of the welcome screens is up (they cover the editor until it's needed)
+  document.querySelectorAll("#welcome .scr").forEach(s => s.classList.toggle("on", s.id === id));
+  $("welcome").style.display = "flex";
+}
 function showWelcome(title, text){
+  $("welcome").classList.remove("loading"); screen("w_msg");
+  $("wtitle").textContent = title; text ? $("wtext").textContent = text : $("wtext").innerHTML = WTEXT;
+  $("w_back").style.display = gone ? "none" : "";
+}
+function home(){
   $("welcome").classList.remove("loading");
-  $("welcome").style.display = "flex"; $("wtitle").textContent = title; text ? $("wtext").textContent = text : $("wtext").innerHTML = WTEXT;
+  if (stacking) return screen("w_stack");
+  screen("w_home"); $("h_back").style.display = loaded ? "" : "none";
 }
 function showLoading(step){
   showWelcome(step); $("welcome").classList.add("loading");
@@ -963,20 +1433,23 @@ function applyInfo(info){
   DEF = info.defaults;
   if (info.app) $("cmd").style.display = "none";      // the packaged app has no command line to paste into
   if (!built){ buildControls(); setTone(DEF); }       // show every control (greyed out) before an image is open
-  if (!info.loaded){ showWelcome("Open a stacked image"); return; }
+  if (info.stacking){ screen("w_stack"); pollStack(); }    // the page was reloaded mid-stack
+  if (!info.loaded){ if (!info.stacking) home(); return; }
   loaded = true; window.FILE = info.file; W = info.W; H = info.H;
   showOriginal(info.n); setStep("Stretching and bringing out color…");
   $("file").textContent = ""; $("file").title = info.file;
   const sub = document.createElement("small"); sub.textContent = W + "×" + H + " after edge crop";
   $("file").append(info.name, sub);
-  $("welcome").style.display = "none"; $("ctlwrap").classList.remove("off"); $("ctlwrap").inert = false;
+  if (!stacking) $("welcome").style.display = "none";
+  $("ctlwrap").classList.remove("off"); $("ctlwrap").inert = false;
   $("msg").textContent = ""; cx = 0.5; cy = 0.5; detailSize();
   P = P.stretch ? P : {...DEF};
   setTone(P); setAngle(0);
 }
-async function openWith(url){
+async function openWith(url, picking = true){
   $("open1").disabled = $("open2").disabled = true;
-  showWelcome("Choose a file…", "A file picker window should have opened (it can hide behind the browser).");
+  if (picking) showWelcome("Choose a file…", "A file picker window should have opened (it can hide behind the browser).");
+  else showLoading("Opening your image…");
   watchLoad();
   try{
     const r = await fetch(url, {method:"POST"}); const j = await r.json(); stopWatch();
@@ -984,7 +1457,7 @@ async function openWith(url){
     if (j.error === "nodialog")
       showWelcome("Drag your image here", "No file picker is available on this computer. Drag your stacked TIFF onto this page instead.");
     else if (j.error) showWelcome("Couldn't open that file", j.error);
-    else if (j.cancelled){ loaded ? $("welcome").style.display = "none" : showWelcome("Open a stacked image"); }
+    else if (j.cancelled) home();
     else applyInfo(j);
   } catch(e){ stopWatch(); endIntro(); showWelcome("Error", String(e)); }
   $("open1").disabled = $("open2").disabled = false;
@@ -1033,8 +1506,107 @@ function watchLoad(){             // poll while the server loads, to show the or
     } catch(e){}
   }, 250);
 }
-function stopWatch(){ clearInterval(watcher); }
-$("open1").onclick = $("open2").onclick = () => openWith("/open");
+function stopWatch(){ clearInterval(watcher); watcher = null; }
+$("open1").onclick = () => openWith("/open");
+$("open2").onclick = home;
+$("w_back").onclick = $("s_back").onclick = home;
+$("h_back").onclick = () => { $("welcome").style.display = "none"; };
+document.querySelectorAll(".mode").forEach(b => b.onclick = () => b.dataset.mode === "process" ? openWith("/open") : setup(b.dataset.mode));
+
+/* ---------- stacking: pick the folders, then watch it build up ---------- */
+const KINDS = ["lights", "dark", "flat", "bias"];
+let MODE = "both", FOLD = {lights:null, dark:null, flat:null, bias:null}, stacking = false, stackT = null, shownImg = 0;
+function setup(mode){
+  MODE = mode;
+  $("s_title").textContent = mode === "both" ? "Stack & process" : "Stack only";
+  $("s_err").textContent = ""; drawFolders(); screen("w_setup");
+}
+function drawFolders(){
+  KINDS.forEach(k => {
+    const r = $("f_"+k), f = FOLD[k], fn = r.querySelector(".fn");
+    const fp = r.querySelector(".pth"); r.querySelector(".fp").title = f ? f.path : "";
+    fp.textContent = f ? "\u200e" + f.path : "";   // the mark keeps the path left-to-right inside the rtl box
+    fn.textContent = f ? (f.n ? f.n + (f.n === 1 ? " frame" : " frames") : "no raw files") : "";
+    fn.classList.toggle("bad", !!f && !f.n);
+    r.classList.toggle("has", !!f);
+  });
+  const n = FOLD.lights?.n || 0;
+  $("s_go").disabled = n < 2;
+  $("s_go").textContent = n >= 2 ? `Stack ${n} frames` : "Start stacking";
+  const cal = KINDS.slice(1).filter(k => FOLD[k]?.n).length;
+  $("s_note").textContent = !FOLD.lights ? "Dark, flat and bias folders next to the lights are filled in automatically." :
+    cal ? "Folders are optional. Darks remove hot pixels and glow, flats fix vignetting and dust, bias is used with flats."
+        : "No calibration folders found next to the lights. They're optional, but darks and flats improve the result.";
+}
+function gotFolders(j, kind){
+  if (j.error){ $("s_err").textContent = j.error; return; }
+  $("s_err").textContent = "";
+  if (kind === "lights") FOLD = {lights:null, dark:null, flat:null, bias:null, ...j};
+  else FOLD[kind] = j[kind];
+  drawFolders();
+}
+KINDS.forEach(k => {
+  const r = $("f_"+k);
+  r.querySelector(".pick").onclick = r.querySelector(".fp").onclick = async () => {
+    const start = (FOLD[k] || FOLD.lights)?.path || "";
+    $("s_err").textContent = "A folder picker window should have opened (it can hide behind the browser).";
+    try{
+      const j = await (await fetch(`/pickdir?kind=${k}&start=${encodeURIComponent(start)}`, {method:"POST"})).json();
+      if (j.error === "nodialog") $("s_err").textContent = "No folder picker on this computer. Stack from the command line instead: python astrobake.py <folder>";
+      else if (j.cancelled) $("s_err").textContent = "";
+      else gotFolders(j, k);
+    } catch(e){ $("s_err").textContent = String(e); }
+  };
+  r.querySelector(".clr").onclick = () => { FOLD[k] = null; drawFolders(); };
+});
+$("s_go").onclick = async () => {
+  const q = new URLSearchParams({process: MODE === "both" ? 1 : 0});
+  KINDS.forEach(k => { if (FOLD[k]?.n) q.set(k, FOLD[k].path); });
+  try{
+    const j = await (await fetch("/stack?" + q, {method:"POST"})).json();
+    if (j.error){ $("s_err").textContent = j.error; return; }
+  } catch(e){ $("s_err").textContent = String(e); return; }
+  $("s_img").removeAttribute("src"); $("s_bar").style.width = "0"; $("s_step").textContent = "Starting…"; $("s_eta").textContent = "";
+  screen("w_stack"); pollStack();
+};
+$("s_cancel").onclick = () => { $("s_cancel").disabled = true; $("s_step").textContent = "Stopping…"; fetch("/stackcancel", {method:"POST"}); };
+function eta(p){
+  if (p.frac < 0.04 || p.elapsed < 20) return "";
+  const s = p.elapsed * (1 - p.frac) / p.frac;
+  return s < 60 ? "less than a minute left" : `about ${Math.round(s/60)} min left`;
+}
+function pollStack(){
+  stacking = true; shownImg = 0; $("s_cancel").disabled = false;
+  clearInterval(stackT);
+  stackT = setInterval(async () => {
+    let p; try{ p = await (await fetch("/stackprogress")).json(); } catch(e){ return; }
+    if (p.state === "stacking"){
+      $("s_bar").style.width = (p.frac*100).toFixed(1) + "%";
+      if (!$("s_cancel").disabled) $("s_step").textContent = p.text;
+      $("s_eta").textContent = eta(p);
+      if (p.n && p.n !== shownImg){ shownImg = p.n; $("s_img").src = "/stackpreview?n=" + p.n; }
+    } else if (p.state === "loading"){
+      if (!watcher){ stacking = false; showLoading("Opening your stack…"); watchLoad(); }
+    } else {
+      clearInterval(stackT); stackT = null; stopWatch(); watcher = null; stacking = false; stackDone(p);
+    }
+  }, 500);
+}
+async function stackDone(p){
+  if (p.state === "cancelled") return setup(MODE);
+  if (p.state === "error"){ endIntro(); return showWelcome("Stacking didn't work", p.error); }
+  if (p.loaded) return applyInfo(await (await fetch("/info")).json());
+  const r = p.report, mins = Math.max(1, Math.round(r.seconds/60));
+  $("d_file").textContent = r.file;
+  const cal = r.calibration.map(k => ({dark:"darks", flat:"flats", bias:"bias"})[k]);
+  let t = `${r.used} of ${r.total} frames · ${r.W} × ${r.H} px · ${mins} min · ` +
+          (cal.length ? "calibrated with " + cal.join(", ").replace(/, ([^,]*)$/, " and $1") : "no calibration frames");
+  if (r.skipped.length) t += ". Left out: " + r.skipped.map(([f, why]) => `${f} (${why})`).join(", ");
+  $("d_info").textContent = t;
+  $("d_process").onclick = () => openWith("/load?path=" + encodeURIComponent(r.file), false);
+  screen("w_done");
+}
+$("d_again").onclick = () => setup("stack");
 
 /* ---------- drag and drop: the browser only gives us the file's contents, so upload them ---------- */
 let gone = false;
@@ -1058,7 +1630,8 @@ addEventListener("drop", async e => {
 /* ---------- lifetime: tell the server we're here, and when we leave ---------- */
 function closed(){
   showWelcome("Astrobake has closed", "Start it again to keep working. You can close this tab.");
-  gone = true; endIntro(); $("open1").style.display = "none";
+  gone = true; endIntro(); $("open1").style.display = $("w_back").style.display = "none";
+  clearInterval(stackT); stacking = false;
   $("ctlwrap").classList.add("off"); $("ctlwrap").inert = true; $("quit").disabled = $("open2").disabled = true;
 }
 $("quit").onclick = async () => { try{ await fetch("/quit", {method:"POST"}); } catch(e){} closed(); };
@@ -1072,13 +1645,14 @@ def downloads_dir():
     return d if os.path.isdir(d) else os.path.expanduser("~")
 
 
-def pick_file(initial_dir=""):
-    """Native file dialog, run in a subprocess so it works from the server thread on every OS.
-    Returns path, "" if cancelled, or None if no GUI toolkit is available."""
+def pick_file(initial_dir="", folder_title=None):
+    """Native file dialog (or folder dialog, given a title), run in a subprocess so it works from the
+    server thread on every OS. Returns path, "" if cancelled, or None if no GUI toolkit is available."""
     me = [sys.executable] if FROZEN else [sys.executable, os.path.abspath(__file__)]
     fd, result = tempfile.mkstemp(suffix=".txt"); os.close(fd)
+    extra = ["dir", folder_title] if folder_title else []
     try:
-        r = subprocess.run([*me, "--pick-file", initial_dir, result], capture_output=True, timeout=1800)
+        r = subprocess.run([*me, "--pick-file", initial_dir, result, *extra], capture_output=True, timeout=1800)
         if r.returncode != 0:
             return None
         with open(result, encoding="utf-8") as f: return f.read().strip()
@@ -1096,6 +1670,9 @@ def run_ui(path=None, crop=True, port=8765, open_browser=True, out=None, auto_qu
     DW, DH = 1100, 700                     # 1:1 detail window size (pixels)
     seen = {"last": time.monotonic(), "bye": None}
     prog = {"n": 0, "busy": False, "step": None, "orig": None}   # the load in progress, polled by the page
+    # the stack in progress (it runs in its own thread for minutes, the page polls it)
+    stk = {"state": "idle", "text": "", "frac": 0.0, "t0": 0.0, "img": None, "n": 0, "report": None,
+           "error": None, "cancel": False, "loaded": False}
 
     def load_image(p, name=None):
         """Load a file from disk, or (with `name`) a temporary copy of a file dropped onto the page.
@@ -1125,8 +1702,45 @@ def run_ui(path=None, crop=True, port=8765, open_browser=True, out=None, auto_qu
                  prev=np.ascontiguousarray(full[::k, ::k]))   # strided: keeps real per-pixel noise
         print("ready")
 
+    def folder(d):
+        return {"path": d, "n": len(raw_files(d))} if d else None
+
+    def scan(kind, path):
+        """What's in a folder the user picked or typed: for lights, also the calibration folders found with it."""
+        path = os.path.abspath(os.path.expanduser(path.strip()))
+        if not os.path.isdir(path): return {"error": f"Not a folder: {path}"}
+        if kind != "lights": return {kind: folder(path)}
+        found = find_folders(path)
+        return {k: folder(found.get(k)) for k in ("lights",) + CAL_KINDS}
+
+    def run_stack(dirs, then_process):
+        def progress(text, frac, img=None):
+            stk.update(text=text, frac=frac)
+            if img is not None: stk["img"] = jpeg_bytes(img, 85); stk["n"] += 1
+        try:
+            r = stack(dirs["lights"], dirs.get("dark"), dirs.get("flat"), dirs.get("bias"),
+                      progress=progress, cancelled=lambda: stk["cancel"])
+            stk["report"] = r
+            if then_process:
+                stk["state"] = "loading"
+                with lock: load_image(r["file"])
+                stk["loaded"] = True
+            stk["state"] = "done"
+        except Cancelled:
+            print("stacking cancelled"); stk["state"] = "cancelled"
+        except ImportError:
+            stk.update(state="error", error="Stacking raw files needs the rawpy package:  pip install rawpy")
+        except MemoryError:
+            stk.update(state="error", error="Ran out of memory. Close other programs and try again.")
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            stk.update(state="error", error=str(e))
+        finally:
+            gc.collect()
+
     def info():
-        d = {"loaded": S.get("path") is not None, "defaults": DEFAULTS, "app": FROZEN, "n": S.get("n")}
+        d = {"loaded": S.get("path") is not None, "defaults": DEFAULTS, "app": FROZEN, "n": S.get("n"),
+             "stacking": stk["state"] in ("stacking", "loading")}
         if d["loaded"]:
             d.update(file=S["path"], name=S["name"], W=S["W"], H=S["H"], DW=DW, DH=DH)
         return d
@@ -1192,6 +1806,11 @@ def run_ui(path=None, crop=True, port=8765, open_browser=True, out=None, auto_qu
                     return self.send(b"ok", "text/plain")
                 if u.path == "/progress":
                     return self.send_json({k: prog[k] for k in ("n", "busy", "step")} | {"orig": prog["orig"] is not None})
+                if u.path == "/stackprogress":
+                    keys = ("state", "text", "frac", "n", "report", "error", "loaded")
+                    return self.send_json({k: stk[k] for k in keys} | {"elapsed": time.monotonic() - stk["t0"]})
+                if u.path == "/stackpreview":
+                    return self.send(stk["img"], "image/jpeg") if stk["img"] else self.send(b"none", "text/plain", 404)
                 if u.path == "/original":
                     n = int(num(q, "n", -1))
                     img = prog["orig"] if n == prog["n"] else S.get("orig") if n == S.get("n") else None
@@ -1230,6 +1849,34 @@ def run_ui(path=None, crop=True, port=8765, open_browser=True, out=None, auto_qu
                         return self.send_json({"error": f"File not found: {p}"})
                     with lock: load_image(p)
                     return self.send_json(info())
+                if u.path == "/load":                   # a file Astrobake knows the path of (a stack it just made)
+                    p = q.get("path", [""])[0]
+                    if not os.path.isfile(p): return self.send_json({"error": f"File not found: {p}"})
+                    with lock: load_image(p)
+                    return self.send_json(info())
+                if u.path == "/pickdir":
+                    kind = q.get("kind", ["lights"])[0]
+                    start = q.get("start", [""])[0] or S.get("dir") or (os.path.expanduser("~") if FROZEN else os.getcwd())
+                    titles = {"lights": "Choose the folder of light frames", "dark": "Choose the dark frames folder",
+                              "flat": "Choose the flat frames folder", "bias": "Choose the bias frames folder"}
+                    p = pick_file(start, titles.get(kind, "Choose a folder"))
+                    if p is None: return self.send_json({"error": "nodialog"})
+                    if p == "": return self.send_json({"cancelled": True})
+                    return self.send_json(scan(kind, p))
+                if u.path == "/stack":
+                    if stk["state"] in ("stacking", "loading"):
+                        return self.send_json({"error": "A stack is already being made"})
+                    dirs = {k: q[k][0] for k in ("lights",) + CAL_KINDS if q.get(k, [""])[0]}
+                    if len(raw_files(dirs.get("lights", ""))) < 2:
+                        return self.send_json({"error": "The lights folder needs at least 2 raw files"})
+                    stk.update(state="stacking", text="Starting…", frac=0.0, t0=time.monotonic(), img=None,
+                               report=None, error=None, cancel=False, loaded=False)
+                    threading.Thread(target=run_stack, args=(dirs, q.get("process", ["0"])[0] == "1"),
+                                     daemon=True).start()
+                    return self.send_json({"ok": True})
+                if u.path == "/stackcancel":
+                    stk["cancel"] = True
+                    return self.send_json({"ok": True})
                 if u.path == "/upload":                 # file dropped onto the page
                     name = os.path.basename(q.get("name", ["image.tif"])[0])
                     left = int(self.headers.get("Content-Length", 0))
@@ -1294,7 +1941,7 @@ def run_ui(path=None, crop=True, port=8765, open_browser=True, out=None, auto_qu
 # ---------------------------------------------------------------- CLI
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("input", nargs="?", help="stacked TIFF (optional in UI mode)")
+    p.add_argument("input", nargs="?", help="stacked TIFF, or a folder of raw frames to stack first (optional in UI mode)")
     p.add_argument("--batch", action="store_true", help="no UI: process straight to files")
     p.add_argument("--port", type=int, default=8765, help="web UI port (default 8765)")
     p.add_argument("--no-browser", action="store_true", help="don't auto-open the browser")
@@ -1302,6 +1949,10 @@ def main():
     p.add_argument("--tif", action="store_true", help="batch: also write a 16-bit TIFF")
     p.add_argument("--scale", type=float, default=1.0, help="batch: output size, e.g. 0.5 for half (default 1)")
     p.add_argument("--no-crop", action="store_true", help="skip the automatic dead-edge crop")
+    p.add_argument("--stack-only", action="store_true", help="folder input: just write the stacked TIFF")
+    for k, what in (("darks", "dark"), ("flats", "flat"), ("bias", "bias")):
+        p.add_argument(f"--{k}", metavar="DIR", help=f"folder input: {what} frames (default: a '{k}' folder "
+                       "found next to the lights), or 'none'")
     d = DEFAULTS
     p.add_argument("--stretch", type=float, default=d["stretch"], help="arcsinh strength: higher = brighter faint stuff, compressed core")
     p.add_argument("--target", type=float, default=d["target"], help="midtone brightness after stretch (0.05-0.35)")
@@ -1317,6 +1968,20 @@ def main():
     p.add_argument("--crop", default=None, help="x0,y0,x1,y1 as fractions of the rotated image "
                    "(default: largest crop with no empty corners)")
     args = p.parse_args()
+    if args.input and os.path.isdir(args.input):          # raw frames: stack them, then carry on with the result
+        found = find_folders(args.input)
+        for k, opt in (("dark", args.darks), ("flat", args.flats), ("bias", args.bias)):
+            if opt: found[k] = None if opt.lower() == "none" else opt
+        for k in ("lights",) + CAL_KINDS:
+            if found.get(k): print(f"{k:>6}: {found[k]} ({len(raw_files(found[k]))} raw files)")
+        try:
+            r = stack(found["lights"], found.get("dark"), found.get("flat"), found.get("bias"),
+                      progress=lambda text, frac, img=None: print(f"\r{frac * 100:3.0f}%  {text:<60}", end="", flush=True))
+        except (ValueError, ImportError) as e:
+            sys.exit(f"\n{e}")
+        print()
+        if args.stack_only: return
+        args.input = r["file"]
     if args.input and not os.path.isfile(args.input):
         sys.exit(f"File not found: {args.input}")
 

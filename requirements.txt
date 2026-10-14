@@ -3,3 +3,4 @@ tifffile
 imagecodecs
 opencv-python-headless
 pillow
+rawpy
