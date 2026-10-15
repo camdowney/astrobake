@@ -36,16 +36,16 @@ Astrobake starts by asking what you'd like to do: **Stack & process**, **Stack o
 
 ### Stacking
 
-1. Click **Stack & process** or **Stack only**, then choose the folder of light frames (your photos of the target, as camera raw files: `.CR2`, `.CR3`, `.NEF`, `.ARW`, `.RAF`, `.DNG` and so on). Folders of dark, flat and bias frames next to it, named like `darks`, `flats` and `bias`, are filled in automatically. You can also choose the folder that holds them all. Calibration frames are optional but help: darks remove hot pixels and amp glow, flats fix vignetting and dust shadows, and bias frames are used with the flats.
+1. Click **Stack & process** or **Stack only**, then choose the folder of light frames (your photos of the target, as camera raw files: `.CR2`, `.CR3`, `.NEF`, `.ARW`, `.DNG` and so on, or FITS files from an astronomy camera). Folders of dark, flat and bias frames next to it, named like `darks`, `flats` and `bias`, are filled in automatically. You can also choose the folder that holds them all. Calibration frames are optional but help: darks remove hot pixels and amp glow, flats fix vignetting and dust shadows, and bias frames are used with the flats.
 2. Optionally, use the menu next to each folder to use fewer frames for a quicker result. For lights it keeps the best ones, with the sharpest stars and darkest sky. Click **Stack**. You'll see each frame with the stars Astrobake found, then watch the stack build up as frames are added. About 100 frames from a 24-megapixel camera take 7 minutes on a 4-core laptop.
 
-Astrobake leaves out frames with too few stars (clouds) or blurry, trailed stars. It also rejects satellite and plane trails pixel by pixel. The result is saved as `stacked.tif`, a linear 32-bit TIFF, in the folder that holds your lights folder. With **Stack & process** it then opens straight into processing.
+Astrobake leaves out frames with too few stars (clouds) or blurry, trailed stars. Sharper, less noisy frames count for more in the average. Satellite and plane trails are rejected pixel by pixel, even in stacks of just a few frames. The result is saved as `stacked.tif`, a linear 32-bit TIFF, in the folder that holds your lights folder. With **Stack & process** it then opens straight into processing.
 
-Bayer-sensor cameras are supported, which covers nearly every DSLR and mirrorless camera. Fujifilm X-Trans and monochrome sensors are not. Darks should match the lights' exposure time, ISO and temperature.
+Colour (Bayer) and monochrome sensors are supported, which covers nearly every DSLR, mirrorless and astronomy camera. Colour FITS frames need the `BAYERPAT` keyword, which capture programs such as N.I.N.A., SharpCap and ASIStudio write. A mono camera gives a greyscale stack. Fujifilm X-Trans sensors and compressed FITS files are not supported. Darks should match the lights' exposure time, ISO or gain, and temperature.
 
 ### Processing
 
-1. Click **Process a stack** and choose your stacked TIFF (16- or 32-bit), or drag it onto the page.
+1. Click **Process a stack** and choose your stacked TIFF or FITS (16- or 32-bit), or drag it onto the page.
 2. Adjust rotation, crop and the tone sliders. Every slider starts at 0, Astrobake's automatic setting. To check fine detail, drag the dashed box on the preview, or drag the 1:1 detail view itself.
 3. Pick a **Size** and click **Export**. 50% often looks sharper than 100%, since most stacks hold less detail than their pixel count. Astrobake saves `<name>_processed_<width>x<height>.jpg` next to your original file. Exporting the same size again never overwrites it: the next one gets `_2`, and so on. Tick **Also save 16-bit TIFF** first if you want a copy for further editing. (For a dragged-in file, browsers don't reveal where it came from, so they go in your Downloads folder.)
 
@@ -75,9 +75,18 @@ The UI shows the exact command for whatever you've dialed in. Give it a folder i
 python3 astrobake.py lights/ --stack-only         # just stacked.tif
 python3 astrobake.py lights/ --batch              # stack, then process with default settings
 python3 astrobake.py lights/ --darks ~/darks-iso800 --flats none
+python3 astrobake.py lights/ --rejection sigma --kappa 2.5 --no-weights   # the stacking of earlier versions
 ```
 
 Run `python3 astrobake.py --help` for all options.
+
+### Tests
+
+```
+python3 test_astrobake.py
+```
+
+The stacking tests need sample frames in `main/`, `dark/`, `flat/` and `bias/` folders next to the script (not in git). They stack a small, cropped subset, about 2 minutes in all, and fail if the result has fewer stars, wider stars or more noise than the original stacking code gave.
 
 ## Building the apps
 

@@ -3,10 +3,11 @@
 astrobake.py - stacking of raw deep-sky frames and automatic processing of the stack,
 with a local web UI (sliders + live preview) or straight from the command line.
 
-Stacking: master bias/dark/flat -> calibrate each light (dark, flat, hot pixels) -> debayer
--> align on star triangles -> kappa-sigma clipped average -> linear 32-bit stacked.tif.
-Processing (of that, or a DSS/Siril stack): crop dead stacking edges -> remove background
-gradient -> neutralize sky -> star-based white balance -> color-preserving arcsinh stretch -> black point
+Stacking: camera raw or FITS frames, colour (Bayer) or mono -> master bias/dark/flat -> calibrate each
+light (dark, flat, hot pixels) -> debayer -> align on star triangles -> average weighted by noise and star
+sharpness, winsorized sigma clipping -> linear 32-bit stacked.tif.
+Processing (of that, or a DSS/Siril stack, TIFF or FITS): crop dead stacking edges -> remove background
+gradient (polynomial + vignetting) -> neutralize sky -> star-based white balance -> color-preserving arcsinh stretch -> black point
 + midtone stretch -> SCNR green removal -> S-curve -> saturation -> background
 noise reduction -> final sky neutralization -> rotate -> crop.
 
@@ -40,7 +41,8 @@ if sys.argv[1:2] == ["--pick-file"]:
         p = filedialog.askdirectory(title=sys.argv[5], initialdir=sys.argv[2] or None, mustexist=True)
     else:
         p = filedialog.askopenfilename(title="Open stacked image", initialdir=sys.argv[2] or None,
-                                       filetypes=[("TIFF images", "*.tif *.tiff"), ("All files", "*.*")])
+                                       filetypes=[("TIFF or FITS images", "*.tif *.tiff *.fit *.fits *.fts"),
+                                                  ("All files", "*.*")])
     with open(sys.argv[3], "w", encoding="utf-8") as f: f.write(p or "")
     sys.exit(0)
 
@@ -114,7 +116,71 @@ from PIL import Image
 
 
 # ---------------------------------------------------------------- loading / linear prep
+FITS_EXT = {".fit", ".fits", ".fts"}
+
+
+def read_fits(path):
+    """Primary image of an uncompressed FITS file: (header dict, array with the top row first).
+    BZERO/BSCALE applied; 16-bit unsigned data stays uint16, other integers become float32.
+    A colour image comes back as (3, H, W)."""
+    hdr, name = {}, os.path.basename(path)
+    with open(path, "rb") as f:
+        while "END" not in hdr:
+            block = f.read(2880)
+            if len(block) < 2880 or (not hdr and not block.startswith(b"SIMPLE  =")):
+                raise ValueError(f"{name}: not a FITS file")
+            for i in range(0, 2880, 80):
+                card = block[i:i + 80].decode("ascii", "replace")
+                key = card[:8].strip()
+                if key == "END": hdr["END"] = True; break
+                if card[8:10] != "= ": continue
+                v = card[10:].strip()
+                if v.startswith("'"):                    # string, '' is an escaped quote
+                    m = re.match(r"'((?:[^']|'')*)'", v)
+                    hdr[key] = m[1].replace("''", "'").rstrip() if m else v
+                    continue
+                v = v.split("/")[0].strip()
+                if v in ("T", "F"): hdr[key] = v == "T"
+                else:
+                    try: hdr[key] = int(v)
+                    except ValueError:
+                        try: hdr[key] = float(v.replace("D", "E"))
+                        except ValueError: hdr[key] = v
+        bitpix, naxis = hdr.get("BITPIX"), hdr.get("NAXIS", 0)
+        if naxis < 2:
+            raise ValueError(f"{name}: no image in the main part of this FITS file "
+                             "(compressed FITS isn't supported, save it uncompressed)")
+        shape = tuple(hdr[f"NAXIS{i}"] for i in range(naxis, 0, -1))
+        if naxis > 3 or (naxis == 3 and shape[0] not in (1, 3)):
+            raise ValueError(f"{name}: unsupported FITS image shape {shape}")
+        dt = {8: ">u1", 16: ">i2", 32: ">i4", -32: ">f4", -64: ">f8"}.get(bitpix)
+        if dt is None: raise ValueError(f"{name}: unsupported FITS BITPIX {bitpix}")
+        a = np.fromfile(f, dt, count=math.prod(shape))
+        if a.size < math.prod(shape): raise ValueError(f"{name}: the FITS file is cut short")
+        a = a.reshape(shape)
+    bzero, bscale = hdr.get("BZERO", 0), hdr.get("BSCALE", 1)
+    if bitpix == 16 and bzero == 32768 and bscale == 1:
+        a = (a.view(">u2") ^ 0x8000).astype(np.uint16)  # the usual unsigned 16-bit encoding
+    elif bitpix == 8 and bzero == 0 and bscale == 1:
+        a = a.astype(np.uint16)
+    else:
+        a = a.astype(np.float32)
+        if bscale != 1: a *= bscale
+        if bzero: a += bzero
+    if naxis == 3 and shape[0] == 1: a = a[0]
+    if str(hdr.get("ROWORDER", "BOTTOM-UP")).upper() != "TOP-DOWN":
+        a = np.ascontiguousarray(a[..., ::-1, :])        # FITS stores the bottom row first
+    return hdr, a
+
+
 def load(path):
+    if os.path.splitext(path)[1].lower() in FITS_EXT:
+        a = read_fits(path)[1]
+        a = a / np.float32(65535) if a.dtype == np.uint16 else a.astype(np.float32)
+        if a.ndim == 3: a = np.moveaxis(a, 0, -1)
+        else: a = np.stack([a] * 3, -1)
+        a /= max(1.0, float(a.max()))
+        return np.ascontiguousarray(a)
     try:
         a = tifffile.imread(path)
     except Exception as e:
@@ -163,28 +229,33 @@ def autocrop(a, margin=20):
     return a[t:b, l:r].copy()
 
 
-def remove_gradient(a, order=2):
-    """Fit a low-order 2D polynomial to sky-only samples and subtract it per channel."""
+def remove_gradient(a, order=3, radial=(2, 3)):
+    """Fit a smooth background to sky-only samples and subtract it per channel: a 2D polynomial (light
+    pollution, sky glow) plus terms in r^4 and r^6 around the centre, the shape of the vignetting that flats
+    didn't fix (or there were none). Few enough terms that it can't bend around a galaxy's faint outskirts."""
     H, W, _ = a.shape
     sm = cv2.resize(a, (W // 16, H // 16), interpolation=cv2.INTER_AREA)
+    h, w = sm.shape[:2]
     L = sm.mean(2)
     med = np.median(L); mad = 1.4826 * np.median(abs(L - med))
     mask = cv2.medianBlur(L, 5) < med + 2 * mad          # reject galaxy / stars
     mask = cv2.erode(mask.astype(np.uint8), np.ones((13, 13))) > 0  # stay off halos
     yy, xx = np.nonzero(mask)
-    Y, X = yy / sm.shape[0] - .5, xx / sm.shape[1] - .5
-    pw = [(i, j) for i in range(order + 1) for j in range(order + 1 - i)]
-    A = np.stack([X**i * Y**j for i, j in pw], 1)
-    gx = (np.arange(W, dtype=np.float32) / W - .5)[None, :]
-    gy = (np.arange(H, dtype=np.float32) / H - .5)[:, None]
+    def terms(X, Y):                                     # X, Y from -0.5 to 0.5 across the image
+        rr = X * X + (Y * h / w) ** 2                    # squared distance from the centre, in width units
+        return [X**i * Y**j for i in range(order + 1) for j in range(order + 1 - i)] + [rr**k for k in radial]
+    A = np.stack(terms((xx + .5) / w - .5, (yy + .5) / h - .5), 1)
+    qh, qw = max(1, H // 4), max(1, W // 4)            # evaluated at quarter size: it's smooth
+    T = terms(((np.arange(qw, dtype=np.float32) + .5) / qw - .5)[None, :],
+              ((np.arange(qh, dtype=np.float32) + .5) / qh - .5)[:, None])
     for c in range(3):
-        v = cv2.medianBlur(sm[..., c], 5)[yy, xx]
-        coef = np.linalg.lstsq(A, v, rcond=None)[0]
-        for _ in range(3):                                  # sigma-clip outliers
-            r = v - A @ coef; k = abs(r) < 3 * r.std()
+        v = cv2.medianBlur(np.ascontiguousarray(sm[..., c]), 5)[yy, xx]
+        k = np.ones(len(v), bool)
+        for _ in range(4):                                  # sigma-clip outliers
             coef = np.linalg.lstsq(A[k], v[k], rcond=None)[0]
-        bg = sum(k * gx**i * gy**j for k, (i, j) in zip(coef, pw)).astype(np.float32)
-        a[..., c] -= bg; del bg
+            r = v - A @ coef; k = abs(r) < 3 * r[k].std()
+        bg = np.broadcast_to(sum(cf * t for cf, t in zip(coef, T)), (qh, qw)).astype(np.float32)
+        a[..., c] -= cv2.resize(bg, (W, H), interpolation=cv2.INTER_CUBIC); del bg
         a[..., c] -= np.median(a[::4, ::4, c])              # sky -> 0, equal per channel
     return a
 
@@ -393,9 +464,10 @@ class Cancelled(Exception):
 
 
 def raw_files(d):
+    """Camera raw and FITS frames in folder d."""
     try:
         return sorted(os.path.join(d, f) for f in os.listdir(d)
-                      if os.path.splitext(f)[1].lower() in RAW_EXT and not f.startswith("."))
+                      if os.path.splitext(f)[1].lower() in RAW_EXT | FITS_EXT and not f.startswith("."))
     except OSError:
         return []
 
@@ -426,25 +498,55 @@ def find_folders(path):
 
 
 def read_raw(path):
-    """Undemosaiced sensor data of a camera raw file, cropped to the usable area.
-    Returns (uint16 mosaic, Bayer pattern like "RGGB", 2x2 black levels, white level, daylight WB as R,G,B)."""
+    """Undemosaiced sensor data of a camera raw or FITS frame, cropped to the usable area. Returns (mosaic,
+    Bayer pattern like "RGGB" or None for a monochrome sensor, 2x2 black levels, white level, white balance:
+    daylight R,G,B for colour or [1] for mono). The mosaic is uint16, or float32 from a floating-point FITS."""
+    if os.path.splitext(path)[1].lower() in FITS_EXT:
+        return read_fits_frame(path)
     import rawpy
     with rawpy.imread(path) as r:
         pat = r.raw_pattern
-        if pat is None or pat.shape != (2, 2):
-            raise ValueError(f"{os.path.basename(path)}: only Bayer-sensor cameras are supported "
-                             "(not Fujifilm X-Trans or monochrome sensors)")
+        mono = r.num_colors == 1 or pat is None
+        if not mono and pat.shape != (2, 2):
+            raise ValueError(f"{os.path.basename(path)}: Fujifilm X-Trans sensors aren't supported, "
+                             "only Bayer and monochrome sensors")
         a = r.raw_image_visible; s = r.sizes
         y0, x0 = getattr(s, "crop_top_margin", 0) or 0, getattr(s, "crop_left_margin", 0) or 0
         h = (getattr(s, "crop_height", 0) or a.shape[0] - y0) & ~1   # even, so the pattern tiles exactly
         w = (getattr(s, "crop_width", 0) or a.shape[1] - x0) & ~1
         a = a[y0:y0 + h, x0:x0 + w].copy()
+        if mono:
+            black = np.full((2, 2), float(r.black_level_per_channel[0]), np.float32)
+            return a, None, black, float(r.white_level), np.ones(1, np.float32)
         desc = r.color_desc.decode()
         idx = [[pat[(i + y0) % 2][(j + x0) % 2] for j in (0, 1)] for i in (0, 1)]
         bayer = "".join(desc[idx[i][j]] for i in (0, 1) for j in (0, 1)).replace("g", "G")
         black = np.array([[r.black_level_per_channel[idx[i][j]] for j in (0, 1)] for i in (0, 1)], np.float32)
         wb = np.array(r.daylight_whitebalance[:3], np.float32)
         return a, bayer, black, float(r.white_level), wb if wb.min() > 0 else np.ones(3, np.float32)
+
+
+def read_fits_frame(path):
+    """read_raw for a FITS frame from an astronomy camera. Colour sensors are recognized by the BAYERPAT
+    keyword, which (with XBAYROFF/YBAYROFF) describes the data as stored; read_fits may flip it top-down."""
+    hdr, a = read_fits(path)
+    name = os.path.basename(path)
+    if a.ndim == 3:
+        raise ValueError(f"{name} is already a colour image. Stacking needs the frames straight from the camera")
+    if a.dtype != np.uint16: a = a.astype(np.float32)
+    white = 65535.0 if a.dtype == np.uint16 or float(a.max()) > 2 else 1.0
+    pat = str(hdr.get("BAYERPAT", hdr.get("COLORTYP", ""))).strip().upper()
+    if pat not in ("RGGB", "BGGR", "GRBG", "GBRG"):
+        return a, None, np.zeros((2, 2), np.float32), white, np.ones(1, np.float32)
+    H = a.shape[0]
+    xo, yo = int(hdr.get("XBAYROFF", 0)) % 2, int(hdr.get("YBAYROFF", 0)) % 2
+    flipped = str(hdr.get("ROWORDER", "BOTTOM-UP")).upper() != "TOP-DOWN"
+    def at(i, j):                                    # colour of the pixel at row i, column j of `a`
+        r = (H - 1 - i if flipped else i) + yo
+        return pat[(r % 2) * 2 + (j + xo) % 2]
+    a = a[:a.shape[0] & ~1, :a.shape[1] & ~1]
+    bayer = "".join(at(i, j) for i in (0, 1) for j in (0, 1))
+    return np.ascontiguousarray(a), bayer, np.zeros((2, 2), np.float32), white, np.ones(3, np.float32)
 
 
 def ordered_map(fn, items, workers=2):
@@ -472,7 +574,7 @@ def make_master(paths, tick):
     groups = [paths[i::math.ceil(len(paths) / per)] for i in range(math.ceil(len(paths) / per))]
     acc = np.zeros(first.shape, np.float32)
     for g in groups:
-        stack = np.empty((len(g),) + first.shape, np.uint16)
+        stack = np.empty((len(g),) + first.shape, first.dtype)
         for k, a in enumerate(ordered_map(lambda p: read_raw(p)[0], g)):
             if a.shape != first.shape:
                 raise ValueError(f"{os.path.basename(g[k])} is {a.shape[1]}x{a.shape[0]}, the others are "
@@ -486,14 +588,16 @@ def make_master(paths, tick):
 
 class Calibration:
     """Master frames and the per-frame light calibration: subtract dark (or bias), divide by flat,
-    fix hot pixels, debayer, white balance. Everything ends up scaled so a saturated pixel is about 1."""
+    fix hot pixels, debayer, white balance. Everything ends up scaled so a saturated pixel is about 1.
+    A monochrome sensor (bayer None) gives one channel instead of three."""
 
     def __init__(self, sample, masters):
         a, self.bayer, self.black, white, wb = read_raw(sample)
         self.shape = a.shape
+        self.channels = 3 if self.bayer else 1
         self.scale = 1.0 / (white - float(self.black.mean()))
         self.wb = wb / wb.max()                          # never push a channel past saturation
-        self.code = getattr(cv2, f"COLOR_Bayer{self.bayer[3]}{self.bayer[2]}2RGB_EA")
+        if self.bayer: self.code = getattr(cv2, f"COLOR_Bayer{self.bayer[3]}{self.bayer[2]}2RGB_EA")
         blk = np.tile(self.black, (a.shape[0] // 2, a.shape[1] // 2))
         bias, dark, flat = masters.get("bias"), masters.get("dark"), masters.get("flat")
         for name, m in (("bias", bias), ("dark", dark), ("flat", flat)):
@@ -503,17 +607,22 @@ class Calibration:
         self.flat = None
         if flat is not None:
             f = flat - (bias if bias is not None else blk)
-            for p in cfa_planes(f):                       # per color, so the flat doesn't tint the image
+            for p in self.planes(f):                      # per color, so the flat doesn't tint the image
                 p /= max(1e-6, float(np.median(p)))
             self.flat = np.maximum(f, 0.05)
         self.hot = None
         if dark is not None:                              # pixels the dark frames show to be hot
             d = dark - (bias if bias is not None else blk)
             self.hot = np.zeros(d.shape, bool)
-            for p, h in zip(cfa_planes(d), cfa_planes(self.hot)):
+            adu = white / 16383                           # one step of a 14-bit raw, in this camera's units
+            for p, h in zip(self.planes(d), self.planes(self.hot)):
                 med = float(np.median(p)); mad = 1.4826 * float(np.median(np.abs(p - med)))
-                h[:] = p > med + max(10 * mad, 30)
+                h[:] = p > med + max(10 * mad, 30 * adu)
             if self.hot.mean() > 0.01: self.hot = None   # implausibly many: leave it to the clipping
+
+    def planes(self, a):
+        """The mosaic's pixels of each colour (views), or the whole image for a mono sensor."""
+        return cfa_planes(a) if self.bayer else [a]
 
     def mosaic(self, path):
         a = read_raw(path)[0]
@@ -524,11 +633,12 @@ class Calibration:
         if self.flat is not None: a /= self.flat
         a *= self.scale
         if self.hot is not None:
-            for p, h in zip(cfa_planes(a), cfa_planes(self.hot)):
+            for p, h in zip(self.planes(a), self.planes(self.hot)):
                 p[h] = cv2.medianBlur(np.ascontiguousarray(p), 3)[h]
         return a
 
     def rgb(self, cfa):
+        if not self.bayer: return cfa[..., None]
         # OpenCV's edge-aware demosaic needs integers: pedestal keeps faint negative noise, 50000 keeps precision
         u = cv2.cvtColor(np.clip(cfa * 50000 + 2000, 0, 65535).astype(np.uint16), self.code)
         a = u.astype(np.float32); del u
@@ -536,7 +646,8 @@ class Calibration:
         return a
 
     def levels(self, cfa):
-        """Per-channel sky level (R, G, B after white balance), from the mosaic."""
+        """Per-channel sky level (R, G, B after white balance, or just one for mono), from the mosaic."""
+        if not self.bayer: return np.array([np.median(cfa[::4, ::4])], np.float32)
         p = [float(np.median(q[::2, ::2])) for q in cfa_planes(cfa)]
         g = [p[i] for i, ch in enumerate(self.bayer) if ch == "G"]
         return np.array([p[self.bayer.index("R")], sum(g) / len(g), p[self.bayer.index("B")]], np.float32) * self.wb
@@ -559,9 +670,18 @@ def find_stars(L, n=150):
     win = np.clip(d[ys[:, None, None] + r[None, :, None], xs[:, None, None] + r[None, None, :]], 0, None)
     flux = win.sum((1, 2)) + 1e-12
     cx = (win * r[None, None, :]).sum((1, 2)) / flux; cy = (win * r[None, :, None]).sum((1, 2)) / flux
-    fwhm = 2 * np.sqrt((win >= 0.5 * win.max((1, 2), keepdims=True)).sum((1, 2)) / np.pi)   # from the half-max area
+    core = win * (win >= 0.5 * win.max((1, 2), keepdims=True))   # the part above half maximum
+    fwhm = 2 * np.sqrt((core > 0).sum((1, 2)) / np.pi)      # from the half-max area
+    # elongation of that core from its second moments: a star is round, a satellite or plane trail is a line
+    cf = core.sum((1, 2)) + 1e-12
+    ux = (core * r[None, None, :]).sum((1, 2)) / cf; uy = (core * r[None, :, None]).sum((1, 2)) / cf
+    mxx = (core * r[None, None, :] ** 2).sum((1, 2)) / cf - ux * ux
+    myy = (core * r[None, :, None] ** 2).sum((1, 2)) / cf - uy * uy
+    mxy = (core * r[None, :, None] * r[None, None, :]).sum((1, 2)) / cf - ux * uy
+    half, disc = (mxx + myy) / 2, np.sqrt(((mxx - myy) / 2) ** 2 + mxy ** 2)
+    round_ = half + disc + .25 < 9 * (half - disc + .25)     # long axis under ~3x the short one (+.25: pixel size)
     top = L[ys, xs] < 0.95 * float(L.max())                 # skip saturated cores, they centroid poorly
-    ok = (fwhm > 1.5) & (fwhm < 9) & top & (np.hypot(cx, cy) < 2)   # rejects hot pixels and smudges
+    ok = (fwhm > 1.5) & (fwhm < 9) & top & (np.hypot(cx, cy) < 2) & round_   # rejects hot pixels, smudges, trails
     o = np.argsort(-flux[ok])[:n]
     pts = np.stack([xs[ok][o] + cx[ok][o], ys[ok][o] + cy[ok][o]], 1)
     return pts, float(np.median(fwhm[ok][o])) if ok.any() else 0.0
@@ -623,10 +743,14 @@ def _refine(M, src, dst):
 
 def superpixel(cfa, bayer, wb, longest=1600):
     """Small RGB view of a mosaic without demosaicing: each 2x2 cell becomes one pixel, then every k-th
-    pixel so the longest side is about `longest`. Returns (image, k) with k the stride in half-size pixels."""
+    pixel so the longest side is about `longest`. Returns (image, k) with k the stride in half-size pixels.
+    A mono sensor (bayer None) gives a one-channel image."""
+    k = max(1, math.ceil(max(cfa.shape) / 2 / longest))
+    if not bayer:
+        h, w = cfa.shape
+        return cfa.reshape(h // 2, 2, w // 2, 2).mean((1, 3))[::k, ::k, None].astype(np.float32), k
     p = dict(zip(range(4), cfa_planes(cfa)))
     g = [p[i] for i, ch in enumerate(bayer) if ch == "G"]
-    k = max(1, math.ceil(max(cfa.shape) / 2 / longest))
     rgb = np.stack([p[bayer.index("R")][::k, ::k], (g[0][::k, ::k] + g[-1][::k, ::k]) / 2,
                     p[bayer.index("B")][::k, ::k]], -1).astype(np.float32)
     return rgb * wb, k
@@ -640,8 +764,9 @@ def subset(paths, frac):
 
 
 def quick_look(a):
-    """Auto-stretched view of a (small) linear image, for showing a stack as it builds up."""
+    """Auto-stretched RGB view of a (small) linear image, for showing a stack as it builds up."""
     s = np.array(a, np.float32)
+    if s.shape[-1] == 1: s = np.repeat(s, 3, -1)          # mono
     for c in range(3):
         x = s[..., c]; sub = x[::3, ::3]                  # statistics from a sample: this runs once per frame
         med = float(np.median(sub)); mad = 1.4826 * float(np.median(np.abs(sub - med))) + 1e-9
@@ -651,25 +776,34 @@ def quick_look(a):
     return s
 
 
-def stack(lights, darks=None, flats=None, bias=None, out=None, kappa=2.5, best=1.0, cal_use=None,
-          progress=None, cancelled=None):
+REJECTION = ("winsorized", "sigma")
+
+
+def stack(lights, darks=None, flats=None, bias=None, out=None, kappa=None, best=1.0, cal_use=None,
+          rejection="winsorized", weighted=True, progress=None, cancelled=None):
     """Calibrate, align and combine a folder of raw light frames into a linear 32-bit TIFF, which is
     returned (path, report). `best` < 1 stacks only that share of the lights (sharpest stars, darkest sky);
     `cal_use` = {"dark": 0.5, ...} builds masters from that share of the calibration frames.
+    `rejection` is how outlying pixels are found: "winsorized" sigma clipping (robust, one more pass over
+    the frames) or plain "sigma" clipping, at `kappa` standard deviations (default 3 and 2.5). `weighted` gives frames
+    with less noise and sharper stars more say in the average.
     `progress(text, fraction, preview=None)` hears about each step; `cancelled()` returning True stops
     at the next frame."""
     say = progress or (lambda text, frac, img=None: None)
     stop = cancelled or (lambda: False)
     paths = raw_files(lights)
-    if len(paths) < 2: raise ValueError(f"Need at least 2 raw files to stack, found {len(paths)} in {lights}")
+    if len(paths) < 2: raise ValueError(f"Need at least 2 raw or FITS files to stack, found {len(paths)} in {lights}")
+    if rejection not in REJECTION: raise ValueError(f"rejection must be one of {', '.join(REJECTION)}")
+    kappa = kappa or (3.0 if rejection == "winsorized" else 2.5)
     cal_use = cal_use or {}
     cal_paths = {k: subset(raw_files(d), cal_use.get(k, 1.0)) if d else []
                  for k, d in (("bias", bias), ("dark", darks), ("flat", flats))}
     n = len(paths)
     # cost of each step per frame, relative to reading a calibration frame (measured), for an honest progress bar
     MEASURE, PASS = 0.7, 1.5
-    expect = n if best >= 0.999 else min(n, max(2, round(n * best)))   # frames that will go through both passes
-    work = {"done": 0.0, "total": sum(len(v) for v in cal_paths.values()) + n * MEASURE + expect * 2 * PASS}
+    passes = 3 if rejection == "winsorized" else 2        # full passes over the aligned frames
+    expect = n if best >= 0.999 else min(n, max(2, round(n * best)))   # frames that will go through every pass
+    work = {"done": 0.0, "total": sum(len(v) for v in cal_paths.values()) + n * MEASURE + expect * passes * PASS}
     t0 = time.monotonic()
 
     def tick(w=1.0, text=None, img=None):
@@ -703,12 +837,14 @@ def stack(lights, darks=None, flats=None, bias=None, out=None, kappa=2.5, best=1
         cfa = cal.mosaic(p)
         h, w = cfa.shape
         L = cfa.reshape(h // 2, 2, w // 2, 2).mean((1, 3))
-        pts, fwhm = find_stars(L); del L
+        pts, fwhm = find_stars(L)
+        dx = L[::2, 1:] - L[::2, :-1]                     # neighbour differences: noise without the sky's structure
+        noise = 1.4826 * float(np.median(np.abs(dx - np.median(dx)))) / math.sqrt(2); del L, dx
         img, k = superpixel(cfa, cal.bayer, cal.wb)       # the frame with the stars it found circled
         img = quick_look(img); r = max(8, int(fwhm / k + 6))
         for x, y in pts / k:
             cv2.circle(img, (int(round(x)), int(round(y))), r, (0.45, 0.85, 0.55), 1, cv2.LINE_AA)
-        return {"path": p, "stars": pts, "fwhm": fwhm * 2, "sky": cal.levels(cfa), "img": img}
+        return {"path": p, "stars": pts, "fwhm": fwhm * 2, "sky": cal.levels(cfa), "noise": noise, "img": img}
     for i, f in enumerate(ordered_map(measure, paths, 3)):
         info.append(f); tick(MEASURE, f"Finding stars ({i + 1}/{n})", f.pop("img"))
     counts = np.array([len(f["stars"]) for f in info]); fw = np.array([f["fwhm"] for f in info])
@@ -734,11 +870,16 @@ def stack(lights, darks=None, flats=None, bias=None, out=None, kappa=2.5, best=1
     use = [f for f in info if "skip" not in f and "drop" not in f]
     for name, why in skipped: print(f"skipping {name}: {why}")
     if len(use) < 2: raise ValueError("Fewer than 2 frames could be aligned")
-    work["total"] -= (expect - len(use)) * 2 * PASS          # frames left out as unusable
+    work["total"] -= (expect - len(use)) * passes * PASS     # frames left out as unusable
+    # weight ~ 1 / (noise^2 * FWHM^2): a star's peak goes as 1/FWHM^2, so this is its signal-to-noise squared
+    for f in use: f["w"] = 1 / max(f["noise"] ** 2 * f["fwhm"] ** 2, 1e-30) if weighted else 1.0
+    wmean = sum(f["w"] for f in use) / len(use)
+    for f in use: f["w"] /= wmean
     print(f"stacking {len(use)} of {n} frames, reference {os.path.basename(ref['path'])}, "
-          f"FWHM {ref['fwhm']:.2f}px")
+          f"FWHM {ref['fwhm']:.2f}px, weights {min(f['w'] for f in use):.2f}-{max(f['w'] for f in use):.2f}, "
+          f"{rejection} rejection at kappa {kappa}")
 
-    H, W = cal.shape
+    H, W = cal.shape; C = cal.channels
     pk = max(1, math.ceil(max(W, H) / 1600))              # preview stride
     def aligned(f):
         a = cal.rgb(cal.mosaic(f["path"]))
@@ -746,46 +887,93 @@ def stack(lights, darks=None, flats=None, bias=None, out=None, kappa=2.5, best=1
         out = cv2.warpAffine(a, f["M"], (W, H), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
         del a
         m = cv2.warpAffine(np.ones((H, W), np.uint8), f["M"], (W, H), flags=cv2.INTER_NEAREST, borderValue=0)
-        return out, cv2.erode(m, np.ones((5, 5), np.uint8))   # drop the border pixels interpolation smeared
+        # (warpAffine drops a single channel's axis)
+        return out.reshape(H, W, C), cv2.erode(m, np.ones((5, 5), np.uint8))   # drop the border pixels interpolation smeared
     B = 512                                               # row band: keeps temporaries small
+    def every_frame(text, fn, preview):
+        """fn(band slice, aligned band, coverage mask band, frame weight) over every frame, band by band."""
+        for i, (a, m) in enumerate(ordered_map(aligned, use)):
+            for y in range(0, H, B):
+                fn(slice(y, y + B), a[y:y + B], m[y:y + B], use[i]["w"])
+            del a, m
+            img = quick_look(preview()) if i % 4 == 3 or i == len(use) - 1 else None
+            tick(PASS, f"{text} ({i + 1}/{len(use)})", img)
+    def mean_and_spread(s, q):
+        """Weighted sums of x and x^2 in s and q -> mean in s, standard deviation in q."""
+        s /= nz; q /= nz; q -= s * s; np.maximum(q, 0, out=q); np.sqrt(q, out=q)
 
-    # pass 2: per-pixel mean and spread over all frames
-    s = np.zeros((H, W, 3), np.float32); q = np.zeros((H, W, 3), np.float32); cnt = np.zeros((H, W), np.uint16)
-    for i, (a, m) in enumerate(ordered_map(aligned, use)):
+    # pass 2: per-pixel weighted mean and spread over all frames
+    s = np.zeros((H, W, C), np.float32); q = np.zeros((H, W, C), np.float32)
+    wsum = np.zeros((H, W), np.float32); cnt = np.zeros((H, W), np.uint16)
+    robust = rejection == "winsorized" and len(use) < 8      # see below
+    if robust:                                            # each pixel's brightest value, and its frame's weight
+        top = np.full((H, W, C), -np.inf, np.float32); wtop = np.zeros((H, W, C), np.float16)
+    def add(b, d, mm, w):
+        mw = mm * np.float32(w)
+        dm = d * mw[..., None]; s[b] += dm; dm *= d; q[b] += dm; wsum[b] += mw; cnt[b] += mm
+        if robust:
+            up = d > top[b]; up &= mm[..., None].astype(bool)
+            top[b][up] = d[up]; wtop[b][up] = w
+    every_frame("Aligning and averaging", add, lambda: s[::pk, ::pk] / np.maximum(wsum[::pk, ::pk], 1e-9)[..., None])
+    if robust:
+        # a small stack: leave each pixel's brightest value out of this first estimate. A satellite, plane or
+        # cosmic ray is nearly always the single brightest value there, and in fewer than 8 frames it inflates
+        # the spread it's judged by too much to ever be caught. This catches it from 3 frames. (In bigger
+        # stacks it isn't needed, and only costs a little noise.)
         for y in range(0, H, B):
-            d, mm = a[y:y + B], m[y:y + B]
-            dm = d * mm[..., None]; s[y:y + B] += dm; dm *= d; q[y:y + B] += dm; cnt[y:y + B] += mm
-        del a, m
-        img = None
-        if i % 4 == 3 or i == len(use) - 1:
-            img = quick_look(s[::pk, ::pk] / np.maximum(cnt[::pk, ::pk], 1)[..., None])
-        tick(PASS, f"Aligning and averaging ({i + 1}/{len(use)})", img)
-    nz = np.maximum(cnt, 1)[..., None]
-    s /= nz; q /= nz; q -= s * s; np.maximum(q, 0, out=q); np.sqrt(q, out=q); q *= kappa   # s = mean, q = clip limit
+            b = slice(y, y + B)
+            ex = (cnt[b] >= 3)[..., None]
+            wt = np.where(ex, wtop[b].astype(np.float32), 0); t = np.where(ex, top[b], 0)
+            wt_t = wt * t; s[b] -= wt_t; wt_t *= t; q[b] -= wt_t; del wt_t, t
+            den = wsum[b][..., None] - wt; den[den <= 0] = 1
+            s[b] /= den; q[b] /= den; q[b] -= s[b] * s[b]; np.maximum(q[b], 0, out=q[b]); np.sqrt(q[b], out=q[b])
+        del top, wtop, ex, wt, den
+    wsum[wsum == 0] = 1; nz = wsum[..., None]; del wsum   # (in place: these arrays are big)
+    if not robust: mean_and_spread(s, q)
+
+    if rejection == "winsorized":
+        # pass 2b: all frames again, with every value pulled in to within 1.5 sigma of that estimate, so outliers
+        # count for little but the brightest values aren't simply dropped; 1.134 corrects the spread for the pulling-in.
+        # The first mean and spread only set those limits, so half precision does (and saves memory).
+        m0 = s.astype(np.float16); del s; sd0 = q.astype(np.float16); del q; gc.collect()
+        s = np.zeros((H, W, C), np.float32); q = np.zeros((H, W, C), np.float32)
+        def add_winsorized(b, d, mm, w):
+            m, lim = m0[b].astype(np.float32), 1.5 * sd0[b].astype(np.float32)
+            x = np.clip(d, m - lim, m + lim); del m, lim
+            wx = x * (mm * np.float32(w))[..., None]; s[b] += wx; wx *= x; q[b] += wx
+        every_frame("Measuring the noise in each pixel", add_winsorized, lambda: m0[::pk, ::pk].astype(np.float32))
+        del m0, sd0
+        mean_and_spread(s, q); q *= 1.134
+        if robust:
+            # leaving out the brightest values made the first spread too small, and the pulling-in inherits
+            # some of that: widen to make up for it (factor from simulations; 3-5 frames still lose a few
+            # percent of good values, against no protection at all from plain clipping)
+            for y in range(0, H, B):
+                nn = np.maximum(cnt[y:y + B], 3).astype(np.float32)
+                q[y:y + B] *= (1 + 1.2 / nn + 6 / nn ** 2)[..., None]
+    q *= kappa; q = q.astype(np.float16)                  # s = mean, q = clip limit
     del nz; gc.collect()
 
     # pass 3: average again, leaving out pixels far from the mean (satellites, planes, hot pixels, cosmic rays)
-    acc = np.zeros((H, W, 3), np.float32); kept = np.zeros((H, W, 3), np.uint16)
-    for i, (a, m) in enumerate(ordered_map(aligned, use)):
-        for y in range(0, H, B):
-            d = a[y:y + B]
-            ok = np.abs(d - s[y:y + B]) <= q[y:y + B] + 1e-7
-            ok &= m[y:y + B, :, None].astype(bool)
-            acc[y:y + B] += np.where(ok, d, 0); kept[y:y + B] += ok
-        del a, m
-        img = None
-        if i % 4 == 3 or i == len(use) - 1:
-            a_, k_ = acc[::pk, ::pk], kept[::pk, ::pk]
-            img = quick_look(np.where(k_ > 0, a_ / np.maximum(k_, 1), s[::pk, ::pk]))
-        tick(PASS, f"Rejecting satellites and noise ({i + 1}/{len(use)})", img)
-    rejected = 1 - float(kept.sum()) / max(1, float(cnt.astype(np.int64).sum()) * 3)
-    out_img = np.where(kept > 0, acc / np.maximum(kept, 1), s); del acc, kept, q, s; gc.collect()
+    acc = np.zeros((H, W, C), np.float32); kept = np.zeros((H, W, C), np.float32); nkept = [0]
+    def add_kept(b, d, mm, w):
+        ok = np.abs(d - s[b]) <= q[b].astype(np.float32) + 1e-7
+        ok &= mm[..., None].astype(bool)
+        acc[b] += np.where(ok, d * np.float32(w), 0); kept[b] += ok * np.float32(w); nkept[0] += int(ok.sum())
+    every_frame("Rejecting satellites and noise", add_kept,
+                lambda: np.where(kept[::pk, ::pk] > 0, acc[::pk, ::pk] / np.maximum(kept[::pk, ::pk], 1e-9), s[::pk, ::pk]))
+    rejected = 1 - nkept[0] / max(1, float(cnt.astype(np.int64).sum()) * C)
+    del q
+    none = kept <= 0                                      # every value rejected: fall back to the mean
+    np.maximum(kept, 1e-9, out=kept); acc /= kept; del kept
+    acc[none] = s[none]; del none, s
+    out_img = acc; del acc; gc.collect()
 
     # keep only the area most frames cover, so drift doesn't leave noisy or empty edges
     t, b, l, r = _shave(cnt < 0.9 * len(use))
     out_img = np.ascontiguousarray(out_img[t:b, l:r])
     # the processing step reads zero as "no data", so lift a background that calibration left at or below zero
-    lo = np.percentile(out_img[::4, ::4].reshape(-1, 3), 0.01, axis=0)
+    lo = np.percentile(out_img[::4, ::4].reshape(-1, C), 0.01, axis=0)
     out_img -= np.minimum(lo, 0)[None, None, :] - 1e-4
     np.maximum(out_img, 1e-6, out=out_img)
     say("Saving the stack…", 0.995)
@@ -793,11 +981,15 @@ def stack(lights, darks=None, flats=None, bias=None, out=None, kappa=2.5, best=1
     base, k = dest, 1
     while os.path.exists(base + ".tif"):
         k += 1; base = f"{dest}_{k}"
-    tifffile.imwrite(base + ".tif", out_img, photometric="rgb")
+    if C == 1: tifffile.imwrite(base + ".tif", out_img[..., 0], photometric="minisblack")
+    else: tifffile.imwrite(base + ".tif", out_img, photometric="rgb")
     secs = time.monotonic() - t0
     report = {"file": os.path.abspath(base + ".tif"), "used": len(use), "total": n, "skipped": skipped,
               "W": int(out_img.shape[1]), "H": int(out_img.shape[0]), "seconds": round(secs),
               "fwhm": round(ref["fwhm"], 2), "rejected": round(100 * rejected, 2), "best": best,
+              "origin": [int(l), int(t)],          # where the stack starts in the reference frame's pixels
+              "rejection": rejection, "kappa": kappa, "mono": C == 1,
+              "weights": [round(min(f["w"] for f in use), 2), round(max(f["w"] for f in use), 2)],
               "calibration": [k for k in CAL_KINDS if cal_paths[k]]}
     print(f"wrote {base}.tif ({out_img.shape[1]}x{out_img.shape[0]}, {len(use)} frames, "
           f"{report['rejected']}% pixels rejected) in {secs / 60:.1f} min")
@@ -1111,7 +1303,7 @@ body.dropping main::after{content:"Drop to open";position:absolute;inset:12px;bo
   <div id="welcome">
     <div class="scr" id="w_msg">
       <h2 id="wtitle">Open a stacked image</h2>
-      <p id="wtext">Pick the TIFF straight out of DeepSkyStacker or Siril (16- or 32-bit),<br>or drag it onto this page.</p>
+      <p id="wtext">Pick the TIFF or FITS straight out of DeepSkyStacker or Siril (16- or 32-bit),<br>or drag it onto this page.</p>
       <div class="wrow"><button id="w_back">Back</button><button class="primary" id="open1">Open stack…</button></div>
     </div>
     <div class="scr" id="w_home">
@@ -1119,7 +1311,7 @@ body.dropping main::after{content:"Drop to open";position:absolute;inset:12px;bo
       <div class="modes">
         <button class="mode" data-mode="both"><b>Stack &amp; process</b><span>Turn raw frames from your camera into a finished picture</span></button>
         <button class="mode" data-mode="stack"><b>Stack only</b><span>Calibrate, align and combine raw frames into a stacked TIFF</span></button>
-        <button class="mode" data-mode="process"><b>Process a stack</b><span>Open a stacked TIFF from DeepSkyStacker, Siril, etc.</span></button>
+        <button class="mode" data-mode="process"><b>Process a stack</b><span>Open a stacked TIFF or FITS from DeepSkyStacker, Siril, etc.</span></button>
       </div>
     </div>
     <div class="scr" id="w_setup">
@@ -1498,7 +1690,7 @@ async function openWith(url, picking = true){
     const r = await fetch(url, {method:"POST"}); const j = await r.json(); stopWatch();
     if (j.error) endIntro();
     if (j.error === "nodialog")
-      showWelcome("Drag your image here", "No file picker is available on this computer. Drag your stacked TIFF onto this page instead.");
+      showWelcome("Drag your image here", "No file picker is available on this computer. Drag your stacked TIFF or FITS onto this page instead.");
     else if (j.error) showWelcome("Couldn't open that file", j.error);
     else if (j.cancelled) home();
     else applyInfo(j);
@@ -1588,7 +1780,7 @@ function drawFolders(){
     const fp = r.querySelector(".pth"); r.querySelector(".fp").title = f ? f.path : "";
     fp.textContent = f ? "\u200e" + f.path : "";   // the mark keeps the path left-to-right inside the rtl box
     const u = +r.querySelector(".use").value, m = f ? useCount(k, f.n, u) : 0;
-    fn.textContent = f ? (!f.n ? "no raw files" : m < f.n ? `${m} of ${f.n} frames` : f.n + (f.n === 1 ? " frame" : " frames")) : "";
+    fn.textContent = f ? (!f.n ? "no raw or FITS files" : m < f.n ? `${m} of ${f.n} frames` : f.n + (f.n === 1 ? " frame" : " frames")) : "";
     fn.classList.toggle("bad", !!f && !f.n);
     r.classList.toggle("has", !!f);
   });
@@ -1737,12 +1929,12 @@ def _linux_dialog(initial_dir, folder_title):
     tries = []
     if shutil.which("zenity"):
         cmd = ["zenity", "--file-selection", f"--title={title}", f"--filename={start}"]
-        cmd += ["--directory"] if folder_title else ["--file-filter=TIFF images | *.tif *.tiff *.TIF *.TIFF",
+        cmd += ["--directory"] if folder_title else ["--file-filter=TIFF or FITS images | *.tif *.tiff *.TIF *.TIFF *.fit *.fits *.fts *.FIT *.FITS *.FTS",
                                                      "--file-filter=All files | *"]
         tries.append(cmd)
     if shutil.which("kdialog"):
         tries.append(["kdialog", "--title", title] + (["--getexistingdirectory", start or "."] if folder_title else
-                     ["--getopenfilename", start or ".", "*.tif *.tiff *.TIF *.TIFF|TIFF images"]))
+                     ["--getopenfilename", start or ".", "*.tif *.tiff *.TIF *.TIFF *.fit *.fits *.fts *.FIT *.FITS *.FTS|TIFF or FITS images"]))
     for cmd in tries:
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=env)
@@ -1976,7 +2168,7 @@ def run_ui(path=None, crop=True, port=8765, open_browser=True, out=None, auto_qu
                         return self.send_json({"error": "A stack is already being made"})
                     dirs = {k: q[k][0] for k in ("lights",) + CAL_KINDS if q.get(k, [""])[0]}
                     if len(raw_files(dirs.get("lights", ""))) < 2:
-                        return self.send_json({"error": "The lights folder needs at least 2 raw files"})
+                        return self.send_json({"error": "The lights folder needs at least 2 raw or FITS files"})
                     stk.update(state="stacking", text="Starting…", frac=0.0, t0=time.monotonic(), img=None,
                                report=None, error=None, cancel=False, loaded=False)
                     use = {k: min(1.0, max(0.01, num(q, k + "_use", 1.0))) for k in dirs}   # share of each folder
@@ -2061,7 +2253,8 @@ def run_ui(path=None, crop=True, port=8765, open_browser=True, out=None, auto_qu
 # ---------------------------------------------------------------- CLI
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("input", nargs="?", help="stacked TIFF, or a folder of raw frames to stack first (optional in UI mode)")
+    p.add_argument("input", nargs="?", help="stacked TIFF or FITS, or a folder of raw or FITS frames to stack first "
+                   "(optional in UI mode)")
     p.add_argument("--batch", action="store_true", help="no UI: process straight to files")
     p.add_argument("--port", type=int, default=8765, help="web UI port (default 8765)")
     p.add_argument("--no-browser", action="store_true", help="don't auto-open the browser")
@@ -2075,6 +2268,12 @@ def main():
     for k, what in (("darks", "dark"), ("flats", "flat"), ("bias", "bias")):
         p.add_argument(f"--{k}", metavar="DIR", help=f"folder input: {what} frames (default: a '{k}' folder "
                        "found next to the lights), or 'none'")
+    p.add_argument("--rejection", choices=REJECTION, default="winsorized",
+                   help="folder input: how satellite trails, planes and hot pixels are found (default winsorized)")
+    p.add_argument("--kappa", type=float, default=None,
+                   help="folder input: reject pixels this many standard deviations out (default 3 winsorized, 2.5 sigma)")
+    p.add_argument("--no-weights", action="store_true",
+                   help="folder input: average all frames equally, not by their noise and star sharpness")
     d = DEFAULTS
     p.add_argument("--stretch", type=float, default=d["stretch"], help="arcsinh strength: higher = brighter faint stuff, compressed core")
     p.add_argument("--target", type=float, default=d["target"], help="midtone brightness after stretch (0.05-0.35)")
@@ -2098,7 +2297,9 @@ def main():
             if found.get(k): print(f"{k:>6}: {found[k]} ({len(raw_files(found[k]))} raw files)")
         try:
             if not 1 <= args.best <= 100: sys.exit("--best must be between 1 and 100")
+            if args.kappa is not None and args.kappa <= 0: sys.exit("--kappa must be more than 0")
             r = stack(found["lights"], found.get("dark"), found.get("flat"), found.get("bias"), best=args.best / 100,
+                      rejection=args.rejection, kappa=args.kappa, weighted=not args.no_weights,
                       progress=lambda text, frac, img=None: print(f"\r{frac * 100:3.0f}%  {text:<60}", end="", flush=True))
         except (ValueError, ImportError) as e:
             sys.exit(f"\n{e}")
