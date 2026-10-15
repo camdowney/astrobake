@@ -1143,7 +1143,8 @@ h2{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--dim)
    display:flex;justify-content:space-between;align-items:center;font-weight:600}
 h2 button{font-size:11px;padding:3px 8px;letter-spacing:0;text-transform:none}
 .filebar{display:flex;gap:8px;align-items:center}
-.file{color:var(--dim);font-size:12px;word-break:break-all;flex:1}
+.file{color:var(--dim);font-size:12px;flex:1;min-width:0}
+.file,.file small{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}   /* one line each: wrapping shifts the layout */
 .file small{display:block;font-size:11px;opacity:.75;margin-top:1px}
 button{background:#242424;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:7px 10px;
        cursor:pointer;font:inherit}
@@ -1835,7 +1836,7 @@ function eta(p){
   return s < 60 ? "less than a minute left" : `about ${Math.round(s/60)} min left`;
 }
 function sideStatus(main, sub){    // the sidebar's file line, while there's no image to name there
-  $("file").textContent = main; $("file").title = "";
+  $("file").textContent = main; $("file").title = sub ? main + "\n" + sub : main;
   if (sub){ const s = document.createElement("small"); s.textContent = sub; $("file").append(s); }
 }
 function pollStack(){
