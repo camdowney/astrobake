@@ -1171,6 +1171,7 @@ input[type=text]{width:100%}
 #msg{font-size:12px;color:var(--dim);margin-top:8px;word-break:break-all}
 code{display:block;background:#111111;border:1px solid var(--line);border-radius:6px;padding:8px;font-size:11px;
      color:var(--dim);margin-top:10px;word-break:break-all;user-select:all}
+code:empty{display:none}
 main{display:grid;grid-template-columns:62% 38%;min-height:0;min-width:0;position:relative}
 .view{position:relative;display:flex;align-items:center;justify-content:center;min-height:0;min-width:0;padding:40px 12px}   /* equal top/bottom so the image is truly centred */
 #stage{position:relative;overflow:hidden;line-height:0;touch-action:none;user-select:none}
@@ -1270,7 +1271,7 @@ body.dropping main::after{content:"Drop to open";position:absolute;inset:12px;bo
 </style></head><body>
 <aside>
   <h1>Astrobake</h1>
-  <div class="filebar"><div class="file" id="file">No image loaded</div><button id="restart" title="Stop what's running, close the image and go back to the start">Start over</button></div>
+  <div class="filebar"><div class="file" id="file">No image loaded<small>Pick an option to begin</small></div><button id="restart" title="Stop what's running, close the image and go back to the start">Start over</button></div>
   <div class="ctlwrap off" id="ctlwrap" inert>
     <h2>Rotate &amp; crop</h2>
     <div class="ctl">
@@ -1761,7 +1762,7 @@ $("restart").onclick = async () => {
 function unload(){
   loaded = false; P = {}; W = H = 0; detAt = null;
   $("ctlwrap").classList.add("off"); $("ctlwrap").inert = true;
-  sideStatus("No image loaded");
+  sideStatus("No image loaded", "Pick an option to begin");
   ["prev", "det", "orig"].forEach(id => $(id).removeAttribute("src"));
   $("res").width = 0; $("marker").style.display = "none";
   $("msg").textContent = $("cmd").textContent = ""; setTone(DEF); exportLabel();
@@ -1854,7 +1855,7 @@ function pollStack(){
       if (!watcher){ stacking = false; showLoading("Opening your stack…"); watchLoad(); }
     } else {
       clearInterval(stackT); stackT = null; stopWatch(); watcher = null; stacking = false;
-      if (!loaded) sideStatus("No image loaded");
+      if (!loaded) sideStatus("No image loaded", "Pick an option to begin");
       stackDone(p);
     }
   }, 500);
