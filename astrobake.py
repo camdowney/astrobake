@@ -339,7 +339,12 @@ def process(a, stretch=900., target=0.13, sat=1.7, sky=0.075, denoise=0.8, chrom
             a[..., c] = np.where(x < pv, pv * (x / pv) ** k, 1 - (1 - pv) * ((1 - x) / (1 - pv)) ** k)
     L = a.mean(2, keepdims=True); a -= L                                # split into brightness + color
     if chroma > 0.05:   # color noise reduction: blur only the color, so stars and structure stay sharp
-        a[:] = cv2.GaussianBlur(a, (0, 0), chroma / px)
+        near = cv2.GaussianBlur(a, (0, 0), chroma / px)
+        # the faint sky's color noise is blotchy on a bigger scale, and there's no fine color there to keep:
+        # blur it 3x wider (the same brightness mask as `denoise`; the sky sits near `target` here)
+        a[:] = cv2.GaussianBlur(a, (0, 0), 3 * chroma / px)
+        w = np.clip((L - target - 0.05) / 0.15, 0, 1)
+        near -= a; near *= w; a += near; del near, w                     # wide in the sky, tight on stars
     a *= sat; a += L; del L                                              # saturation
     np.clip(a, 0, 1, out=a)
 
@@ -350,7 +355,7 @@ def process(a, stretch=900., target=0.13, sat=1.7, sky=0.075, denoise=0.8, chrom
 
     if denoise > 0.05:   # blur only faint areas so galaxy/stars stay sharp
         bl = cv2.GaussianBlur(a, (0, 0), denoise / px)
-        w = np.clip((a.mean(2) - 0.18) / 0.15, 0, 1)[..., None]
+        w = np.clip((a.mean(2) - target - 0.05) / 0.15, 0, 1)[..., None]   # the sky sits near `target`
         a = bl * (1 - w) + a * w; del bl, w; gc.collect()
 
     if "skymed" not in st: st["skymed"] = [float(x) for x in np.median(a[::8, ::8], axis=(0, 1))]
@@ -643,6 +648,11 @@ class Calibration:
         u = cv2.cvtColor(np.clip(cfa * 50000 + 2000, 0, 65535).astype(np.uint16), self.code)
         a = u.astype(np.float32); del u
         a -= 2000; a *= self.wb / 50000
+        # A saturated pixel reads about 1 before white balance, so after it each colour tops out at its own
+        # wb level (red ~1, green ~0.4 on a typical camera) and clipped star cores would come out pink. Clip
+        # every colour where the lowest one saturates (a little under, as raw files can saturate just below
+        # their nominal white level), so they're white, as a camera's own processing does.
+        np.minimum(a, 0.95 * float(self.wb.min()), out=a)
         return a
 
     def levels(self, cfa):
