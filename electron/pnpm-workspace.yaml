@@ -1,0 +1,3 @@
+# electron-builder's Windows helper downloads 7-Zip in an install script, which pnpm blocks by default
+allowBuilds:
+  electron-winstaller: true

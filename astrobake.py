@@ -1169,6 +1169,7 @@ input[type=text]{width:100%}
 .export .primary{width:100%}
 .export label{font-size:13px;display:block;margin:0 0 8px}
 #msg{font-size:12px;color:var(--dim);margin-top:8px;word-break:break-all}
+#msg a{color:var(--acc);word-break:normal}
 code{display:block;background:#111111;border:1px solid var(--line);border-radius:6px;padding:8px;font-size:11px;
      color:var(--dim);margin-top:10px;word-break:break-all;user-select:all}
 code:empty{display:none}
@@ -1643,6 +1644,11 @@ $("exp").addEventListener("click", async () => {
     const r = await fetch("/export?" + qs({crop: C.join(","), tif: $("tif").checked ? 1 : 0, scale: SCALE}), {method:"POST"});
     const j = await r.json();
     $("msg").textContent = j.error ? "Error: "+j.error : "Saved: " + j.files.join(", ");
+    if (!j.error && NATIVE){
+      const a = document.createElement("a"); a.href = "#"; a.textContent = "Show in folder";
+      a.onclick = e => { e.preventDefault(); NATIVE.showFile(j.files[0]); };
+      $("msg").append(" ", a);
+    }
   } catch(e){ $("msg").textContent = "Error: " + e; }
   $("exp").disabled = false;
 });
@@ -1667,7 +1673,7 @@ function showLoading(step){
   showWelcome(step); $("welcome").classList.add("loading");
 }
 function applyInfo(info){
-  DEF = info.defaults;
+  DEF = info.defaults; START = info.start || START;
   if (info.app) $("cmd").style.display = "none";      // the packaged app has no command line to paste into
   if (!built){ buildControls(); setTone(DEF); }       // show every control (greyed out) before an image is open
   if (info.stacking){ screen("w_stack"); pollStack(); }    // the page was reloaded mid-stack
@@ -1682,6 +1688,13 @@ function applyInfo(info){
   $("msg").textContent = ""; cx = 0.5; cy = 0.5; detailSize();
   P = P.stretch ? P : {...DEF};
   setTone(P); setAngle(0);
+}
+const NATIVE = window.astrobake;   // the desktop app (electron/preload.js): native dialogs and real file paths
+let START = "";                    // folder the next file or folder dialog opens in
+async function openFile(){
+  if (!NATIVE) return openWith("/open");
+  const p = await NATIVE.pickFile(START);
+  if (p) openWith("/load?path=" + encodeURIComponent(p), false);
 }
 async function openWith(url, picking = true){
   opening = true; $("open1").disabled = $("restart").disabled = true;
@@ -1744,9 +1757,9 @@ function watchLoad(){             // poll while the server loads, to show the or
   }, 250);
 }
 function stopWatch(){ clearInterval(watcher); watcher = null; }
-$("open1").onclick = () => openWith("/open");
+$("open1").onclick = openFile;
 $("w_back").onclick = $("s_back").onclick = home;
-document.querySelectorAll(".mode").forEach(b => b.onclick = () => b.dataset.mode === "process" ? openWith("/open") : setup(b.dataset.mode));
+document.querySelectorAll(".mode").forEach(b => b.onclick = () => b.dataset.mode === "process" ? openFile() : setup(b.dataset.mode));
 
 /* ---------- start over: stop whatever is running, close the image, back to the first screen ---------- */
 let opening = false;               // a file is being picked or loaded
@@ -1809,9 +1822,16 @@ KINDS.forEach(k => {
   const r = $("f_"+k);
   r.querySelector(".pick").onclick = r.querySelector(".fp").onclick = async () => {
     const start = (FOLD[k] || FOLD.lights)?.path || "";
-    $("s_err").textContent = "A folder picker window should have opened (it can hide behind the browser).";
     try{
-      const j = await (await fetch(`/pickdir?kind=${k}&start=${encodeURIComponent(start)}`, {method:"POST"})).json();
+      let j;
+      if (NATIVE){
+        const p = await NATIVE.pickFolder(k, start || START);
+        if (!p) return;
+        j = await (await fetch(`/scan?kind=${k}&path=${encodeURIComponent(p)}`, {method:"POST"})).json();
+      } else {
+        $("s_err").textContent = "A folder picker window should have opened (it can hide behind the browser).";
+        j = await (await fetch(`/pickdir?kind=${k}&start=${encodeURIComponent(start)}`, {method:"POST"})).json();
+      }
       if (j.error === "nodialog") $("s_err").textContent = "No folder picker on this computer. Stack from the command line instead: python astrobake.py <folder>";
       else if (j.cancelled) $("s_err").textContent = "";
       else gotFolders(j, k);
@@ -1876,7 +1896,7 @@ async function stackDone(p){
 }
 $("d_again").onclick = () => setup("stack");
 
-/* ---------- drag and drop: the browser only gives us the file's contents, so upload them ---------- */
+/* ---------- drag and drop: a browser only gives us the file's contents, so upload them (the app has its path) ---------- */
 let gone = false;
 const canDrop = e => !gone && !stacking && !opening && !watcher && [...e.dataTransfer.types].includes("Files");
 addEventListener("dragover", e => {
@@ -1893,7 +1913,10 @@ addEventListener("drop", async e => {
   showLoading("Opening " + f.name + "…");
   watchLoad();
   try{
-    const r = await fetch("/upload?name=" + encodeURIComponent(f.name), {method:"POST", body:f}); const j = await r.json();
+    const path = NATIVE?.pathFor(f);
+    const r = path ? await fetch("/load?path=" + encodeURIComponent(path), {method:"POST"})
+                   : await fetch("/upload?name=" + encodeURIComponent(f.name), {method:"POST", body:f});
+    const j = await r.json();
     stopWatch();
     if (j.error){ endIntro(); showWelcome("Couldn't open that file", j.error); } else applyInfo(j);
   } catch(e){ stopWatch(); endIntro(); showWelcome("Error", String(e)); }
@@ -1901,14 +1924,14 @@ addEventListener("drop", async e => {
 });
 
 /* ---------- lifetime: tell the server we're here, and when we leave ---------- */
-function closed(title = "Astrobake has closed", text = "Start it again to keep working. You can close this tab."){
+function closed(title = "Astrobake has closed", text = NATIVE ? "Start it again to keep working." : "Start it again to keep working. You can close this tab."){
   showWelcome(title, text);
   gone = true; endIntro(); $("open1").style.display = $("w_back").style.display = "none";
   clearInterval(stackT); stacking = false;
   $("ctlwrap").classList.add("off"); $("ctlwrap").inert = true; $("restart").disabled = true;
 }
 setInterval(() => fetch("/ping").then(r => { if (!r.ok) throw 0; }).catch(closed), 20000);
-addEventListener("pagehide", () => navigator.sendBeacon("/bye"));
+if (!NATIVE) addEventListener("pagehide", () => navigator.sendBeacon("/bye"));
 (async () => { applyInfo(await (await fetch("/info")).json()); })();
 </script></body></html>"""
 
@@ -1967,9 +1990,11 @@ def pick_file(initial_dir="", folder_title=None):
         os.remove(result)
 
 
-def run_ui(path=None, crop=True, port=8765, open_browser=True, out=None, auto_quit=True):
+def run_ui(path=None, crop=True, port=8765, open_browser=True, out=None, auto_quit=True, app=False):
     """Serve the UI. With auto_quit the server stops shortly after the last browser tab closes, or when
-    nothing has been heard for a while - but never in the middle of a stack, which finishes and saves first."""
+    nothing has been heard for a while - but never in the middle of a stack, which finishes and saves first.
+    With app it is the backend of the desktop app (electron/): the window decides when to quit, and the server
+    stops when the app closes its stdin."""
     S = {"path": None}                     # current image state
     lock = threading.Lock()
     DW, DH = 1100, 700                     # 1:1 detail window size (pixels)
@@ -2043,9 +2068,12 @@ def run_ui(path=None, crop=True, port=8765, open_browser=True, out=None, auto_qu
         finally:
             gc.collect()
 
+    def start_dir():
+        return S.get("dir") or (os.path.expanduser("~") if FROZEN or app else os.getcwd())
+
     def info():
         d = {"loaded": S.get("path") is not None, "defaults": DEFAULTS, "app": FROZEN, "n": S.get("n"),
-             "stacking": stk["state"] in ("stacking", "loading")}
+             "stacking": stk["state"] in ("stacking", "loading"), "start": start_dir()}
         if d["loaded"]:
             d.update(file=S["path"], name=S["name"], W=S["W"], H=S["H"], DW=DW, DH=DH)
         return d
@@ -2143,8 +2171,7 @@ def run_ui(path=None, crop=True, port=8765, open_browser=True, out=None, auto_qu
                     seen["bye"] = time.monotonic()
                     return self.send(b"ok", "text/plain")
                 if u.path == "/open":
-                    start = S.get("dir") or (os.path.expanduser("~") if FROZEN else os.getcwd())
-                    p = pick_file(start)
+                    p = pick_file(start_dir())
                     if p is None: return self.send_json({"error": "nodialog"})
                     if p == "": return self.send_json({"cancelled": True})
                     if not os.path.isfile(p):
@@ -2158,13 +2185,15 @@ def run_ui(path=None, crop=True, port=8765, open_browser=True, out=None, auto_qu
                     return self.send_json(info())
                 if u.path == "/pickdir":
                     kind = q.get("kind", ["lights"])[0]
-                    start = q.get("start", [""])[0] or S.get("dir") or (os.path.expanduser("~") if FROZEN else os.getcwd())
+                    start = q.get("start", [""])[0] or start_dir()
                     titles = {"lights": "Choose the folder of light frames", "dark": "Choose the dark frames folder",
                               "flat": "Choose the flat frames folder", "bias": "Choose the bias frames folder"}
                     p = pick_file(start, titles.get(kind, "Choose a folder"))
                     if p is None: return self.send_json({"error": "nodialog"})
                     if p == "": return self.send_json({"cancelled": True})
                     return self.send_json(scan(kind, p))
+                if u.path == "/scan":                   # a folder the desktop app's own dialog picked
+                    return self.send_json(scan(q.get("kind", ["lights"])[0], q.get("path", [""])[0]))
                 if u.path == "/stack":
                     if stk["state"] in ("stacking", "loading"):
                         return self.send_json({"error": "A stack is already being made"})
@@ -2230,8 +2259,20 @@ def run_ui(path=None, crop=True, port=8765, open_browser=True, out=None, auto_qu
     if srv is None:
         sys.exit(f"No free port between {port} and {port + 19}")
     url = f"http://127.0.0.1:{srv.server_address[1]}/"
-    print(f"\nAstrobake running at {url}")
-    print("Leave this window open while you use it. Closing the browser tab (or Ctrl+C here) quits.")
+    if app:
+        print(f"ASTROBAKE_URL {url}", flush=True)   # the desktop app waits for this line
+
+        def parent_gone():                          # stdin closes when the app quits or crashes
+            try:
+                while sys.stdin.buffer.read(1 << 16): pass
+            except Exception:
+                pass
+            srv.shutdown()
+        threading.Thread(target=parent_gone, daemon=True).start()
+        open_browser = auto_quit = False
+    else:
+        print(f"\nAstrobake running at {url}")
+        print("Leave this window open while you use it. Closing the browser tab (or Ctrl+C here) quits.")
     if open_browser:
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()
 
@@ -2260,6 +2301,7 @@ def main():
     p.add_argument("--batch", action="store_true", help="no UI: process straight to files")
     p.add_argument("--port", type=int, default=8765, help="web UI port (default 8765)")
     p.add_argument("--no-browser", action="store_true", help="don't auto-open the browser")
+    p.add_argument("--app", action="store_true", help=argparse.SUPPRESS)   # backend of the desktop app
     p.add_argument("-o", "--out", default=None, help="output name prefix")
     p.add_argument("--tif", action="store_true", help="batch: also write a 16-bit TIFF")
     p.add_argument("--scale", type=float, default=1.0, help="batch: output size, e.g. 0.5 for half (default 1)")
@@ -2312,7 +2354,7 @@ def main():
         sys.exit(f"File not found: {args.input}")
 
     if not args.batch:
-        return run_ui(args.input, not args.no_crop, args.port, not args.no_browser, args.out, )
+        return run_ui(args.input, not args.no_crop, args.port, not args.no_browser, args.out, app=args.app)
 
     if not args.input:
         sys.exit("--batch needs an input file")

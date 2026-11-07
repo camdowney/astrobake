@@ -1,15 +1,9 @@
-# PyInstaller build for the standalone app:  pyinstaller astrobake.spec
-# Windows/Linux: one self-contained executable in dist/.  macOS: dist/Astrobake.app.
-import sys
-
-a = Analysis(["astrobake.py"], excludes=["matplotlib", "IPython", "pytest"])
+# PyInstaller build of the desktop app's backend:  pyinstaller astrobake.spec
+# Output: dist/astrobake-backend/ (a folder, so it starts fast), which electron-builder puts inside the app
+# (see electron/package.json). The app runs it as  astrobake-backend --app  and talks to it over localhost.
+a = Analysis(["astrobake.py"], excludes=["matplotlib", "IPython", "pytest", "tkinter"])
 pyz = PYZ(a.pure)
-
-if sys.platform == "darwin":
-    exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name="Astrobake", console=False)
-    coll = COLLECT(exe, a.binaries, a.datas, name="Astrobake")
-    app = BUNDLE(coll, name="Astrobake.app",
-                 # no windows of its own (the UI is in the browser), so stay out of the Dock
-                 info_plist={"LSUIElement": True, "NSHighResolutionCapable": True})
-else:
-    exe = EXE(pyz, a.scripts, a.binaries, a.datas, [], name="Astrobake", console=False, upx=False)
+# console=True keeps stdout working on Windows (the app reads the backend's address from it);
+# the app starts it with no visible window
+exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name="astrobake-backend", console=True, upx=False)
+coll = COLLECT(exe, a.binaries, a.datas, name="astrobake-backend", upx=False)

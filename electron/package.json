@@ -1,0 +1,68 @@
+{
+  "name": "astrobake",
+  "productName": "Astrobake",
+  "version": "1.0.0",
+  "description": "Stacking and processing of deep-sky astrophotos",
+  "main": "main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder"
+  },
+  "devDependencies": {
+    "electron": "45.2.3",
+    "electron-builder": "26.18.0"
+  },
+  "build": {
+    "appId": "com.astrobake.app",
+    "productName": "Astrobake",
+    "files": [
+      "main.js",
+      "preload.js",
+      "starting.html",
+      "build/icon.png"
+    ],
+    "extraResources": [
+      {
+        "from": "../dist/astrobake-backend",
+        "to": "backend"
+      }
+    ],
+    "asar": true,
+    "win": {
+      "target": "nsis",
+      "icon": "build/icon.png",
+      "artifactName": "Astrobake-Windows-Setup.${ext}"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false
+    },
+    "mac": {
+      "target": "dir",
+      "icon": "build/icon.png",
+      "identity": null,
+      "category": "public.app-category.photography"
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "icon": "build/icon.png",
+      "category": "Graphics",
+      "maintainer": "Cameron <hello@camdowney.com>",
+      "syncDesktopName": true
+    },
+    "deb": {
+      "artifactName": "Astrobake-Linux-${arch}.${ext}"
+    },
+    "appImage": {
+      "artifactName": "Astrobake-Linux-${arch}.${ext}"
+    }
+  },
+  "author": "Cameron <hello@camdowney.com>",
+  "homepage": "https://github.com/camdowney/astrobake",
+  "packageManager": "pnpm@12.15.0",
+  "desktopName": "astrobake.desktop"
+}

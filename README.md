@@ -12,13 +12,14 @@ Astrobake turns your raw deep-sky astrophotography images into finished pictures
 
 Grab the file for your computer from the [latest release](../../releases/latest).
 
-| System                | File                     | To start                                                      |
-| --------------------- | ------------------------ | ------------------------------------------------------------- |
-| Windows               | `Astrobake-Windows.exe`  | Double-click it.                                              |
-| macOS (Apple Silicon) | `Astrobake-macOS.zip`    | Unzip, move `Astrobake.app` to Applications, double-click it. |
-| Linux                 | `Astrobake-Linux.tar.gz` | Extract, double-click `Astrobake`.                            |
+| System                  | File                              | To start                                                                |
+| ----------------------- | --------------------------------- | ----------------------------------------------------------------------- |
+| Windows                 | `Astrobake-Windows-Setup.exe`     | Double-click it. It installs and opens Astrobake, and adds it to Start. |
+| macOS (Apple Silicon)   | `Astrobake-macOS.zip`             | Unzip, move `Astrobake.app` to Applications, double-click it.           |
+| Ubuntu, Debian, Mint    | `Astrobake-Linux-amd64.deb`       | Double-click it to install, or `sudo apt install ./Astrobake-Linux-amd64.deb`. |
+| Other Linux             | `Astrobake-Linux-x86_64.AppImage` | Make it executable (right-click → Properties), then double-click it.    |
 
-Astrobake opens in your web browser. It takes a few seconds to start the first time.
+Astrobake opens in its own window. It takes a few seconds to start.
 
 ### The first time you open it
 
@@ -45,11 +46,11 @@ Colour (Bayer) and monochrome sensors are supported, which covers nearly every D
 
 ### Processing
 
-1. Click **Process a stack** and choose your stacked TIFF or FITS (16- or 32-bit), or drag it onto the page.
+1. Click **Process a stack** and choose your stacked TIFF or FITS (16- or 32-bit), or drag it onto the window.
 2. Adjust rotation, crop and the tone sliders. Every slider starts at 0, Astrobake's automatic setting. To check fine detail, drag the dashed box on the preview, or drag the 1:1 detail view itself.
-3. Pick a **Size** and click **Export**. 50% often looks sharper than 100%, since most stacks hold less detail than their pixel count. Astrobake saves `<name>_processed_<width>x<height>.jpg` next to your original file. Exporting the same size again never overwrites it: the next one gets `_2`, and so on. Tick **Also save 16-bit TIFF** first if you want a copy for further editing. (For a dragged-in file, browsers don't reveal where it came from, so they go in your Downloads folder.)
+3. Pick a **Size** and click **Export**. 50% often looks sharper than 100%, since most stacks hold less detail than their pixel count. Astrobake saves `<name>_processed_<width>x<height>.jpg` next to your original file. Exporting the same size again never overwrites it: the next one gets `_2`, and so on. Tick **Also save 16-bit TIFF** first if you want a copy for further editing. **Show in folder** takes you to it.
 
-**Start over** in the sidebar stops a stack in progress or closes the image and takes you back to the first screen. When you're done, just close the browser tab and Astrobake quits. If a stack is still running, it finishes and saves it first.
+**Start over** in the sidebar stops a stack in progress or closes the image and takes you back to the first screen. When you're done, close the window. If a stack is still running, Astrobake asks first, since quitting stops it.
 
 Large stacks need roughly 6× their file size in memory (about 2 GB for a 24-megapixel image). Stacking needs about 3 GB, however many frames you have.
 
@@ -61,7 +62,17 @@ If you have Python 3.9+:
 python3 astrobake.py
 ```
 
-If any packages are missing it offers to install them. On Linux systems that don't allow that, it sets up a private virtual environment in `.venv` for you.
+This opens Astrobake in your web browser instead of its own window. If any packages are missing it offers to install them. On Linux systems that don't allow that, it sets up a private virtual environment in `.venv` for you. (A file dragged onto the browser page is uploaded, since browsers don't reveal where it came from, so its exports go in your Downloads folder.)
+
+To run the desktop window from source, you also need Node.js and pnpm:
+
+```
+cd electron
+pnpm install
+pnpm start
+```
+
+It runs `astrobake.py` with the Python in `.venv` if there is one, otherwise `python3`. Set `ASTROBAKE_PYTHON` to use a different one.
 
 It also works from the command line without the UI, which is handy for batch jobs:
 
@@ -90,11 +101,17 @@ The stacking tests need sample frames in `main/`, `dark/`, `flat/` and `bias/` f
 
 ## Building the apps
 
-GitHub Actions builds all three apps (see [.github/workflows/release.yml](.github/workflows/release.yml)). Push a version tag to publish a release with them attached:
+Each app is an Electron window ([electron/](electron/)) with the Python backend, built by PyInstaller, inside it. The window starts the backend with `--app` and shows its page; the backend quits when the window closes. GitHub Actions builds all of them (see [.github/workflows/release.yml](.github/workflows/release.yml)). Push a version tag to publish a release with them attached:
 
 ```
 git tag v1.0.0
 git push origin v1.0.0
 ```
 
-To build one locally: `pip install -r requirements.txt pyinstaller`, then `pyinstaller astrobake.spec`. The result goes in `dist/`.
+To build one locally for your own system:
+
+```
+pip install -r requirements.txt pyinstaller
+pyinstaller astrobake.spec              # the backend, in dist/astrobake-backend/
+cd electron && pnpm install && pnpm dist   # the app, in electron/dist/
+```
